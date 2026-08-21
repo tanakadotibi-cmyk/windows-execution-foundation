@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "python_executable": "C:\\Path\\To\\python.exe",
+  "state_dir": "C:\\ProgramData\\WindowsExecutionFoundation",
+  "worker_heartbeat_max_age_seconds": 120,
+  "inflight_stale_seconds": 300,
+  "max_attempts": 5,
+  "retry_base_seconds": 15,
+  "network_probe_url": "https://example.com/",
+  "worker_task_name": "ExecutionFoundation-Worker",
+  "actions": {
+    "example": {
+      "command": ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-NonInteractive", "-File", "C:\\path\\to\\script.ps1"],
+      "allowed_args": ["--mode", "verify"],
+      "timeout_seconds": 600,
+      "requires_network": true,
+      "requires_remote": false,
+      "receipt_source": "C:\\path\\to\\external-receipt.json"
+    }
+  }
+}
