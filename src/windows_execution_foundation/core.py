@@ -47,12 +47,43 @@ def parse_time(value: str) -> datetime:
 
 
 def as_time(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value:
+    kind, parsed = classify_timestamp(value)
+    if kind != "aware":
         return None
+    return parsed
+
+
+def classify_timestamp(value: Any) -> tuple[str, datetime | None]:
+    """Classify a timestamp. A value without an offset is not treated as UTC or JST."""
+    if value is None or value == "":
+        return "absent", None
+    if not isinstance(value, str):
+        return "unreadable", None
     try:
-        return parse_time(value)
+        parsed = parse_time(value)
     except (TypeError, ValueError):
+        return "unreadable", None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return "naive", None
+    return "aware", parsed
+
+
+def invalid_timestamp_record(source: str, record_id: Any, field: str, value: Any) -> dict[str, Any] | None:
+    kind, _parsed = classify_timestamp(value)
+    if kind == "naive":
+        reason = "時差のない時刻"
+    elif kind == "unreadable":
+        reason = "読めない時刻"
+    else:
         return None
+    return {
+        "category": "不正な記録",
+        "source": source,
+        "id": record_id,
+        "field": field,
+        "reason": reason,
+        "value": value if isinstance(value, str) else None,
+    }
 
 
 def stable_key(value: str) -> str:
@@ -538,9 +569,11 @@ class ExecutionFoundation:
             reasons.append("TARGET")
         if "idempotency_key" in value and value.get("idempotency_key") != job.get("idempotency_key"):
             reasons.append("IDEMPOTENCY_KEY")
-        started = as_time(job.get("external_started_at"))
-        generated = as_time(value.get("generated_at"))
-        if started is None or generated is None:
+        started_kind, started = classify_timestamp(job.get("external_started_at"))
+        generated_kind, generated = classify_timestamp(value.get("generated_at"))
+        if started_kind == "naive" or generated_kind == "naive":
+            reasons.append("TIME_NAIVE")
+        elif started_kind != "aware" or generated_kind != "aware" or started is None or generated is None:
             reasons.append("GENERATED_AT")
         else:
             if generated < started:
@@ -552,7 +585,7 @@ class ExecutionFoundation:
         except OSError:
             reasons.append("FILE_MTIME")
         else:
-            if started is not None and mtime + timedelta(seconds=FILE_MTIME_SKEW_SECONDS) < started:
+            if started_kind == "aware" and started is not None and mtime + timedelta(seconds=FILE_MTIME_SKEW_SECONDS) < started:
                 reasons.append("FILE_MTIME_BEFORE_START")
         wrapped = {
             "path": str(path),
@@ -850,8 +883,8 @@ class ExecutionFoundation:
         return value
 
     def _eligible_since(self, job: dict[str, Any], not_before: float) -> datetime | None:
-        created = as_time(job.get("created_at"))
-        if created is None:
+        kind, created = classify_timestamp(job.get("created_at"))
+        if kind != "aware" or created is None:
             return None
         if not_before > 0:
             ready = datetime.fromtimestamp(not_before, UTC)
@@ -886,9 +919,13 @@ class ExecutionFoundation:
             return False
         if content.get("status") not in SUCCESS_EXTERNAL_STATUSES:
             return False
-        started = as_time(job.get("external_started_at")) or as_time(job.get("started_at"))
-        generated = as_time(content.get("generated_at"))
-        if started is None or generated is None or generated < started:
+        started_kind, started = classify_timestamp(job.get("external_started_at"))
+        if started_kind != "aware":
+            started_kind, started = classify_timestamp(job.get("started_at"))
+        generated_kind, generated = classify_timestamp(content.get("generated_at"))
+        if started_kind != "aware" or generated_kind != "aware" or started is None or generated is None:
+            return False
+        if generated < started:
             return False
         return True
 
@@ -925,6 +962,7 @@ class ExecutionFoundation:
         oldest: datetime | None = None
         overdue: list[Any] = []
         unprocessable_pending: list[str] = []
+        invalid_records: list[dict[str, Any]] = []
         eligible = 0
         ineligible = 0
         for path in pending_paths:
@@ -941,18 +979,35 @@ class ExecutionFoundation:
             except (TypeError, ValueError):
                 unprocessable_pending.append(path.stem)
                 continue
+            record_id = job.get("execution_id") or path.stem
+            invalid = invalid_timestamp_record("pending", record_id, "created_at", job.get("created_at"))
+            if invalid is not None:
+                invalid_records.append(invalid)
+                continue
             if not_before > time.time():
                 ineligible += 1
                 continue
             eligible += 1
-            start = self._eligible_since(job, not_before)
-            if start is None:
-                overdue.append(job.get("execution_id") or path.stem)
-                continue
-            if oldest is None or start < oldest:
-                oldest = start
-            if (now - start).total_seconds() > allowed:
-                overdue.append(job.get("execution_id") or path.stem)
+            try:
+                start = self._eligible_since(job, not_before)
+                if start is None:
+                    overdue.append(record_id)
+                    continue
+                if oldest is None or start < oldest:
+                    oldest = start
+                if (now - start).total_seconds() > allowed:
+                    overdue.append(record_id)
+            except (TypeError, ValueError):
+                invalid_records.append(
+                    {
+                        "category": "不正な記録",
+                        "source": "pending",
+                        "id": record_id,
+                        "field": "created_at",
+                        "reason": "時刻の比較に失敗",
+                        "value": job.get("created_at") if isinstance(job.get("created_at"), str) else None,
+                    }
+                )
         queue_status = "PASS" if not overdue and not unprocessable_pending else "ATTENTION"
         oldest_wait = 0.0 if oldest is None else (now - oldest).total_seconds()
 
@@ -968,17 +1023,46 @@ class ExecutionFoundation:
             job = record if isinstance(record, dict) else {}
             execution_id = job.get("execution_id") or job.get("job_id")
             seen_execution.add(execution_id)
+            for field in ("created_at", "started_at", "external_started_at"):
+                invalid = invalid_timestamp_record("done", execution_id, field, job.get(field))
+                if invalid is not None:
+                    invalid_records.append(invalid)
             receipt = receipts_by_execution.get(str(execution_id))
+            if isinstance(receipt, dict):
+                invalid = invalid_timestamp_record("execution_receipt", execution_id, "completed_at", receipt.get("completed_at"))
+                if invalid is not None:
+                    invalid_records.append(invalid)
+                external = receipt.get("external_receipt")
+                content = external.get("content") if isinstance(external, dict) else None
+                if isinstance(content, dict):
+                    invalid = invalid_timestamp_record(
+                        "execution_receipt", execution_id, "generated_at", content.get("generated_at")
+                    )
+                    if invalid is not None:
+                        invalid_records.append(invalid)
             dedup_receipt: Any = {}
             if job.get("dedup_key"):
                 try:
                     dedup_receipt = read_json(self.receipt_path(job["dedup_key"]), {})
                 except (json.JSONDecodeError, OSError):
                     dedup_receipt = {}
-            if self._receipt_matches_done(job, receipt) and self._receipt_matches_done(job, dedup_receipt):
-                matched += 1
-            else:
-                mismatches.append({"execution_id": execution_id, "dedup_key": job.get("dedup_key")})
+            try:
+                if self._receipt_matches_done(job, receipt) and self._receipt_matches_done(job, dedup_receipt):
+                    matched += 1
+                else:
+                    mismatches.append({"execution_id": execution_id, "dedup_key": job.get("dedup_key")})
+            except (TypeError, ValueError):
+                mismatches.append({"execution_id": execution_id, "dedup_key": job.get("dedup_key"), "reason": "TIME_COMPARE_FAILED"})
+                invalid_records.append(
+                    {
+                        "category": "不正な記録",
+                        "source": "done",
+                        "id": execution_id,
+                        "field": "generated_at",
+                        "reason": "時刻の比較に失敗",
+                        "value": None,
+                    }
+                )
         orphan_candidates = list(receipts_by_execution) + [
             execution_id for execution_id in unreadable_execution_ids if execution_id not in receipts_by_execution
         ]
@@ -986,7 +1070,11 @@ class ExecutionFoundation:
         identifier_status = "PASS" if not mismatches and not orphans else "ATTENTION"
         coverage = 1.0 if not done_paths else matched / len(done_paths)
         structural_ok = not inflight and not failed and not unknown and duplicate_receipts == 0
-        status = "PASS" if structural_ok and queue_status == "PASS" and identifier_status == "PASS" else "ATTENTION"
+        status = (
+            "PASS"
+            if structural_ok and queue_status == "PASS" and identifier_status == "PASS" and not invalid_records
+            else "ATTENTION"
+        )
         result = {
             "status": status,
             "observed_at": iso_now(),
@@ -1018,6 +1106,7 @@ class ExecutionFoundation:
                 "mismatches": mismatches,
                 "orphan_execution_ids": orphans,
             },
+            "invalid_records": invalid_records,
             "timing_policy": self.timing_policy(),
             "remote_required_actions": [
                 name
