@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import types
@@ -11,6 +12,7 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 from urllib.parse import unquote
 
 from tests.offline_guard import install
@@ -227,7 +229,42 @@ class DailyV4Tests(unittest.TestCase):
         self.assertEqual(list(v4.RUN_LOG_COLUMNS), module.HEADERS["run_log"])
         self.assertEqual(v4.SCOPES, ["https://www.googleapis.com/auth/spreadsheets"])
         self.assertEqual(v4.DEFAULT_CREDENTIAL, Path(r"C:\TantanJobs\secrets\sheets_writer_sa.dpapi"))
-        self.assertEqual(v4.EXPECTED_CLIENT_EMAIL, "<SA_EMAIL>")
+        source = (ROOT / "src/windows_execution_foundation/cityheaven_daily_metrics_v4.py").read_text(encoding="utf-8")
+        self.assertNotIn("<SA_EMAIL>", source)
+        self.assertNotIn("EXPECTED_CLIENT_EMAIL =", source)
+        self.assertIn("cityheaven_daily_v4_client_email", source)
+        self.assertIn("WEF_CITYHEAVEN_V4_CLIENT_EMAIL", source)
+
+    def test_client_email_comes_from_config_or_environment(self):
+        missing = Path(self.id())  # not a file
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(v4.CLIENT_EMAIL_ENV, None)
+            with self.assertRaises(v4.SheetError) as raised:
+                v4.expected_client_email(missing)
+        self.assertEqual(raised.exception.code, "EXPECTED_CLIENT_EMAIL_UNCONFIGURED")
+        self.assertIn("cityheaven_daily_v4_client_email", raised.exception.details["hint"])
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text(json.dumps({"cityheaven_daily_v4_client_email": "<SA_EMAIL>"}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop(v4.CLIENT_EMAIL_ENV, None)
+                with self.assertRaises(v4.SheetError) as placeholder:
+                    v4.expected_client_email(config)
+            self.assertEqual(placeholder.exception.code, "EXPECTED_CLIENT_EMAIL_UNCONFIGURED")
+            config.write_text(
+                json.dumps({"cityheaven_daily_v4_client_email": "sheets-writer@example.invalid"}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop(v4.CLIENT_EMAIL_ENV, None)
+                self.assertEqual(v4.expected_client_email(config), "sheets-writer@example.invalid")
+            with mock.patch.dict(os.environ, {v4.CLIENT_EMAIL_ENV: "sheets-writer@example.invalid"}):
+                self.assertEqual(v4.expected_client_email(missing), "sheets-writer@example.invalid")
+            with mock.patch.dict(os.environ, {v4.CLIENT_EMAIL_ENV: "other-writer@example.invalid"}):
+                with self.assertRaises(v4.SheetError) as conflict:
+                    v4.expected_client_email(config)
+            self.assertEqual(conflict.exception.code, "EXPECTED_CLIENT_EMAIL_CONFLICT")
+            self.assertNotIn("example.invalid", str(conflict.exception))
 
     def test_rows_match_parallel_builder_and_keep_zero_and_unknown(self):
         analysis = make_analysis("2026-10-21", {
@@ -543,7 +580,7 @@ class DailyV4Tests(unittest.TestCase):
             def decrypt(_data):
                 return json.dumps({
                     "type": "service_account",
-                    "client_email": v4.EXPECTED_CLIENT_EMAIL,
+                    "client_email": "sheets-writer@example.invalid",
                     "private_key": SECRET,
                     "token_uri": "https://oauth2.googleapis.com/token",
                 }).encode()
@@ -551,8 +588,11 @@ class DailyV4Tests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 credential = Path(tmp) / "sheets_writer_sa.dpapi"
                 credential.write_bytes(b"ciphertext-placeholder")
-                with self.assertRaises(v4.SheetError) as raised:
-                    v4.open_authorized_session(credential, decrypt=decrypt)
+                with mock.patch.dict(os.environ, {v4.CLIENT_EMAIL_ENV: "sheets-writer@example.invalid"}):
+                    with self.assertRaises(v4.SheetError) as raised:
+                        v4.open_authorized_session(
+                            credential, decrypt=decrypt, config_path=Path(tmp) / "missing-config.json",
+                        )
             self.assertEqual(raised.exception.code, "CREDENTIAL_AUTH_FAILED")
             self.assertNotIn("SUPERSECRETv4KEY", str(raised.exception))
             self.assertNotIn(SECRET, str(raised.exception))

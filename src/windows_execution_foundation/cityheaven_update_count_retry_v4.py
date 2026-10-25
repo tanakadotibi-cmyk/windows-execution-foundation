@@ -150,8 +150,10 @@ def run_retry_v4(
             result["sheet_write_count"] = 0
             return result
         if transport is None:
-            loader = transport_loader or v4.open_transport
-            transport = loader(credential)
+            if transport_loader is None:
+                transport = v4.open_transport(credential, config_path=config)
+            else:
+                transport = transport_loader(credential)
         outcome = _publish_saved(
             target_date, runtime, mode=selected_mode, titles=titles, transport=transport,
             dry_run=False, create_missing=test_tab is not None, allow_partial=False, now=now,

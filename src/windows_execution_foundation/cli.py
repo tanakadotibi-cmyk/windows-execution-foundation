@@ -5,8 +5,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .airtable_local_exec import run_after_work, run_before_work
-from .core import ExecutionFoundation, FoundationError, exclusive_lock
+from .airtable_local_exec import LocalExecError, run_after_work, run_before_work
+from .core import (
+    ExecutionFoundation, FoundationError, atomic_write_json, exclusive_lock, iso_now,
+)
 
 def _enabled_local_exec(foundation: ExecutionFoundation) -> dict[str, Any] | None:
     config = foundation.config.get("local_exec_airtable")
@@ -17,8 +19,43 @@ def _safe_cycle(name: str, foundation: ExecutionFoundation, config: dict[str, An
         if name == "before":
             return run_before_work(foundation, config)
         return run_after_work(foundation, config)
+    except LocalExecError as exc:
+        return {"status": "ERROR", "error_type": "LocalExecError", "reason_code": str(exc)}
     except Exception as exc:
         return {"status": "ERROR", "error_type": type(exc).__name__}
+
+def _local_exec_errors(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for index, item in enumerate(outcomes):
+        local_exec = item.get("local_exec") if isinstance(item, dict) else None
+        if not isinstance(local_exec, dict):
+            continue
+        for phase in ("before", "after"):
+            payload = local_exec.get(phase)
+            if not isinstance(payload, dict) or payload.get("status") != "ERROR":
+                continue
+            if "reason_code" not in payload:
+                continue
+            found.append({
+                "outcome_index": index,
+                "phase": phase,
+                "error_type": payload.get("error_type"),
+                "reason_code": payload.get("reason_code"),
+            })
+    return found
+
+def _record_local_exec_errors(foundation: ExecutionFoundation, errors: list[dict[str, Any]]) -> None:
+    if not errors:
+        return
+    atomic_write_json(foundation.root / "monitoring" / "local-exec-error.json", {
+        "observed_at": iso_now(),
+        "phases": errors,
+    })
+
+def _apply_local_exec_reason(result: dict[str, Any], errors: list[dict[str, Any]]) -> None:
+    reason = next((item.get("reason_code") for item in errors if item.get("reason_code")), None)
+    if reason:
+        result["local_exec_reason_code"] = reason
 
 
 def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, Any]:
@@ -49,10 +86,15 @@ def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, 
         observe_cycle(foundation, outcomes)  # RESOURCE_WAIT >15 min -> Slack (best-effort)
     except Exception:
         pass
+    errors = _local_exec_errors(outcomes)
+    _record_local_exec_errors(foundation, errors)
     if max_jobs == 1:
+        _apply_local_exec_reason(outcomes[0], errors)
         return outcomes[0]
-    return {"status": "FAILED_FINAL" if any(x["status"] == "FAILED_FINAL" for x in outcomes) else "DRAINED",
-            "lane_id": foundation.config.get("lane_id", "A"), "outcomes": outcomes}
+    summary = {"status": "FAILED_FINAL" if any(x["status"] == "FAILED_FINAL" for x in outcomes) else "DRAINED",
+               "lane_id": foundation.config.get("lane_id", "A"), "outcomes": outcomes}
+    _apply_local_exec_reason(summary, errors)
+    return summary
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Windows Execution Foundation v1")
@@ -80,8 +122,14 @@ def main() -> int:
     else:
         result = foundation.audit()
 
+    return _finish(result)
+
+def _finish(result: dict[str, Any]) -> int:
+    """Print the cycle result and exit. A local-exec reason stays in the output and the status."""
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if result.get("status") not in {"FAILED_FINAL", "ATTENTION"} else 2
+    if result.get("status") in {"FAILED_FINAL", "ATTENTION"} or result.get("local_exec_reason_code"):
+        return 2
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
