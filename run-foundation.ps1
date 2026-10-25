@@ -10,6 +10,8 @@ $Python = $Config.python_executable
 if (-not $Python) { $Python = (Get-Command python.exe -ErrorAction Stop).Source }
 if (-not (Test-Path -LiteralPath $Python)) { throw "Configured Python does not exist: $Python" }
 $env:PYTHONPATH = Join-Path $Root 'src'
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
 $LogDir = Join-Path $Root 'local\logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $LogPath = Join-Path $LogDir ("foundation-{0}.log" -f (Get-Date -Format 'yyyyMMdd'))

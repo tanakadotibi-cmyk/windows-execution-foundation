@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Date>2026-09-26T20:16:30+09:00</Date>
+    <Author>TANTAN-M720S\epuro</Author>
+    <URI>\RankObserver-BusinessMetrics-M720S-v01</URI>
+    <Description>Daily local Rank Observer CSV aggregation to Business Metrics through the existing bridge_watcher writer route.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-26T20:20:00+09:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-21-3349146081-1340512296-21348510-1002</UserId>
+      <LogonType>S4U</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\Users\epuro\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\pythonw.exe</Command>
+      <Arguments>"C:\Users\epuro\Documents\Codex\2026-09-18\windows-execution-foundation\run-rank-observer-metrics.py" --write-airtable --acceptance-replay --evidence "C:\Users\epuro\Documents\Codex\2026-09-18\windows-execution-foundation\local\rank-observer-airtable-sync-v01-20260926.json"</Arguments>
+      <WorkingDirectory>C:\Users\epuro\Documents\Codex\2026-09-18\windows-execution-foundation</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>

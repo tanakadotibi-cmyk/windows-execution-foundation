@@ -1,0 +1,27 @@
+{
+  "schema_version": "cti_bridge_artifact_return_fixture_v1",
+  "positive_expectations": {
+    "locator_status": "CONFIRMED",
+    "terminal_statuses": [
+      "FAILED",
+      "STOPPED"
+    ],
+    "artifact_path_kind": "absolute",
+    "sha256_pattern": "lowercase_hex_64",
+    "notification_added_count": 0,
+    "legacy_keys": [
+      "path",
+      "source",
+      "verifier_eligible"
+    ]
+  },
+  "negative_expectations": {
+    "unproven_relative": "UNRESOLVED",
+    "wrong_job": "IDENTITY_MISMATCH",
+    "wrong_hash": "HASH_MISMATCH",
+    "missing_artifact": "ARTIFACT_MISSING",
+    "permission_denied": "PERMISSION_DENIED"
+  },
+  "unknown_locator": "UNKNOWN",
+  "secret_marker": "fixture-secret-must-not-project"
+}

@@ -11,6 +11,11 @@ $StartedAt = [DateTimeOffset]::Now
 if (-not $ReceiptPath) { $ReceiptPath = Join-Path $Root 'outputs\windows-install-receipt.json' }
 $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
 $Runner = Join-Path $Root 'run-foundation.ps1'
+$Config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$Pythonw = [string]$Config.python_executable -replace 'python\.exe$','pythonw.exe'
+if (-not (Test-Path -LiteralPath $Pythonw)) { throw 'PYTHONW_REQUIRED' }
+$WorkerHidden = Join-Path $Root 'run-worker-hidden.pyw'
+$WatchdogHidden = Join-Path $Root 'run-watchdog-hidden.pyw'
 $WorkerName = 'ExecutionFoundation-Worker'
 $WatchdogName = 'ExecutionFoundation-Watchdog'
 
@@ -45,16 +50,16 @@ if (-not $SkipPowerChanges) {
 }
 
 $PowerShell = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$WorkerAction = New-ScheduledTaskAction -Execute $PowerShell -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1}" -Mode work-once' -f $Runner,$ConfigPath)
-$WatchdogAction = New-ScheduledTaskAction -Execute $PowerShell -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1}" -Mode watchdog' -f $Runner,$ConfigPath)
-$WorkerSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun
-$WatchdogSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Minutes 3) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun
+$WorkerAction = New-ScheduledTaskAction -Execute $Pythonw -Argument ('"{0}"' -f $WorkerHidden) -WorkingDirectory $Root
+$WatchdogAction = New-ScheduledTaskAction -Execute $Pythonw -Argument ('"{0}"' -f $WatchdogHidden) -WorkingDirectory $Root
+$WorkerSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 5) -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun
+$WatchdogSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) -ExecutionTimeLimit (New-TimeSpan -Minutes 3) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$WorkerPrincipal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Highest
-$SystemPrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-$WorkerTriggers = @((New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)))
-$WatchdogTriggers = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)))
-Register-ScheduledTask -TaskName $WorkerName -Action $WorkerAction -Trigger $WorkerTriggers -Settings $WorkerSettings -Principal $WorkerPrincipal -Description 'Remote-independent durable UI worker. Interactive user principal with automatic logon start and one-minute catch-up.' -Force | Out-Null
+$WorkerPrincipal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited
+$SystemPrincipal = New-ScheduledTaskPrincipal -UserId $CurrentUser -LogonType Interactive -RunLevel Limited
+$WorkerTriggers = @((New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)))
+$WatchdogTriggers = @((New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(3) -RepetitionInterval (New-TimeSpan -Minutes 5)))
+Register-ScheduledTask -TaskName $WorkerName -Action $WorkerAction -Trigger $WorkerTriggers -Settings $WorkerSettings -Principal $WorkerPrincipal -Description 'Remote-independent durable UI worker. Interactive user principal with automatic logon start and five-minute fallback.' -Force | Out-Null
 Register-ScheduledTask -TaskName $WatchdogName -Action $WatchdogAction -Trigger $WatchdogTriggers -Settings $WatchdogSettings -Principal $SystemPrincipal -Description 'Independent heartbeat watchdog and stale spool recovery.' -Force | Out-Null
 Start-ScheduledTask -TaskName $WorkerName
 Start-ScheduledTask -TaskName $WatchdogName

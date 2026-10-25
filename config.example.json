@@ -2,20 +2,62 @@
   "schema_version": "1.0",
   "python_executable": "C:\\Path\\To\\python.exe",
   "state_dir": "C:\\ProgramData\\WindowsExecutionFoundation",
-  "worker_heartbeat_max_age_seconds": 120,
-  "inflight_stale_seconds": 300,
+  "worker_heartbeat_max_age_seconds": 900,
+  "inflight_stale_seconds": 900,
   "max_attempts": 5,
   "retry_base_seconds": 15,
   "network_probe_url": "https://example.com/",
   "worker_task_name": "ExecutionFoundation-Worker",
+  "foundation_failure_slack": {
+    "enabled": true,
+    "webhook_environment_variable": "TANTAN_SLACK_WEBHOOK_URL",
+    "notify_user_environment_variable": "TANTAN_SLACK_NOTIFY_USER_ID"
+  },
   "actions": {
     "example": {
-      "command": ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-NonInteractive", "-File", "C:\\path\\to\\script.ps1"],
-      "allowed_args": ["--mode", "verify"],
+      "command": [
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File",
+        "C:\\path\\to\\script.ps1"
+      ],
+      "allowed_args": [
+        "--mode",
+        "verify"
+      ],
       "timeout_seconds": 600,
       "requires_network": true,
       "requires_remote": false,
       "receipt_source": "C:\\path\\to\\external-receipt.json"
+    },
+    "cityheaven-reservation-schedule": {
+      "command": [
+        "C:\\Path\\To\\python.exe",
+        "C:\\path\\to\\run-cityheaven-reservation.py",
+        "--config",
+        "C:\\path\\to\\config.json",
+        "schedule"
+      ],
+      "allowed_args": [],
+      "append_idempotency_key": true,
+      "timeout_seconds": 180,
+      "requires_network": true,
+      "requires_remote": false,
+      "receipt_source_dir": "C:\\ProgramData\\WindowsExecutionFoundation\\cityheaven-reservations\\receipts",
+      "receipt_request_id_field": "reservation_key",
+      "terminal_failure_exit_codes": [20],
+      "redact_subprocess_output": true
     }
-  }
+  },
+  "cityheaven_reservation": {
+    "reader_path": "C:\\path\\to\\CityHeavenAI\\reservation_readonly_monitor.js",
+    "runtime_reader_path": "C:\\path\\to\\windows-execution-foundation\\src\\windows_execution_foundation\\cityheaven_reservation_runtime_reader.js",
+    "node_executable": "C:\\Program Files\\nodejs\\node.exe",
+    "chrome_executable": "C:\\Users\\user\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe",
+    "dedicated_profile_path": "C:\\Users\\user\\CityHeavenAI\\ReservationRuntimeChromeProfile",
+    "cdp_port": 9227,
+    "task_user_id": "S-1-5-21-0000000000-0000000000-0000000000-1001"
+  },
+  "inflight_stale_grace_seconds": 300
 }

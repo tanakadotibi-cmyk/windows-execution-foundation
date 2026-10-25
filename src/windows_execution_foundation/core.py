@@ -14,6 +14,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
 
+from .reservation_pause import action_paused, parse_pause_notice
+
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 class FoundationError(RuntimeError):
     pass
@@ -56,6 +60,7 @@ def atomic_write_json(path: Path, value: Any) -> None:
 def exclusive_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+b")
+    acquired = False
     try:
         if os.name == "nt":
             import msvcrt
@@ -72,6 +77,7 @@ def exclusive_lock(path: Path) -> Iterator[None]:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
                 raise FoundationError("SINGLE_WORKER_LOCKED") from exc
+        acquired = True
         handle.seek(0)
         handle.truncate()
         handle.write(f"pid={os.getpid()} at={iso_now()}".encode())
@@ -79,7 +85,9 @@ def exclusive_lock(path: Path) -> Iterator[None]:
         yield
     finally:
         try:
-            if os.name == "nt":
+            if not acquired:
+                pass
+            elif os.name == "nt":
                 import msvcrt
 
                 handle.seek(0)
@@ -106,14 +114,18 @@ class ExecutionFoundation:
             path.mkdir(parents=True, exist_ok=True)
 
     @classmethod
-    def from_path(cls, path: Path) -> "ExecutionFoundation":
-        return cls(json.loads(path.read_text(encoding="utf-8")))
+    def from_path(cls, path: Path, lane: str = "A") -> "ExecutionFoundation":
+        from .lanes import load_config
+        return cls(load_config(path, lane))
 
     def receipt_path(self, key_hash: str) -> Path:
         return self.receipts / f"{key_hash}.json"
 
     def enqueue(self, *, action: str, idempotency_key: str, args: list[str] | None = None,
-                metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+                metadata: dict[str, Any] | None = None,
+                not_before_epoch: float = 0) -> dict[str, Any]:
+        if action_paused(action):
+            return {"status": "PAUSED_BY_OWNER", "action": action}
         if action not in self.config.get("actions", {}):
             raise FoundationError(f"ACTION_NOT_ALLOWED:{action}")
         key_hash = stable_key(idempotency_key)
@@ -133,7 +145,7 @@ class ExecutionFoundation:
             "dedup_key": key_hash,
             "attempt": 0,
             "created_at": iso_now(),
-            "not_before_epoch": 0,
+            "not_before_epoch": not_before_epoch,
             "metadata": metadata or {},
         }
         with exclusive_lock(self.root / ".spool.lock"):
@@ -142,6 +154,15 @@ class ExecutionFoundation:
                 return {"status": "NOOP_RECEIPT", "dedup_key": key_hash, "receipt": receipt}
             if (self.pending / f"{key_hash}.json").exists() or (self.inflight / f"{key_hash}.json").exists():
                 return {"status": "NOOP_QUEUED", "dedup_key": key_hash}
+            failed = read_json(self.failed / f"{key_hash}.json", {})
+            old_lease = failed.get("resource_lease") or {}
+            shared = self.config.get("shared_resource_dir")
+            if old_lease and shared:
+                active = Path(shared) / "active" / (str(old_lease.get("token", "MISSING")) + ".json")
+                if active.exists():
+                    # A rescue must first prove the old owner/children dead and
+                    # release the exact lease. Requeue never force-releases it.
+                    raise FoundationError("FAILED_REQUEUE_RESOURCE_LEASE_ACTIVE")
             atomic_write_json(self.pending / f"{key_hash}.json", job)
         return {"status": "ENQUEUED", "dedup_key": key_hash, "job_id": job["job_id"]}
 
@@ -163,13 +184,22 @@ class ExecutionFoundation:
         except Exception:
             return False
 
+    def _inflight_stale_limit(self, job: dict[str, Any]) -> int:
+        base = int(self.config.get("inflight_stale_seconds", 900))
+        grace = int(self.config.get("inflight_stale_grace_seconds", 300))
+        action = self.config.get("actions", {}).get(str(job.get("action") or ""), {})
+        timeout = int(action.get("timeout_seconds", 0) or 0) if isinstance(action, dict) else 0
+        return max(base, timeout + grace)
+
     def recover_stale(self) -> int:
-        maximum = int(self.config.get("inflight_stale_seconds", 300))
         now = datetime.now(UTC)
         recovered = 0
         with exclusive_lock(self.root / ".spool.lock"):
             for path in self.inflight.glob("*.json"):
                 job = read_json(path, {})
+                if action_paused(job.get("action")):
+                    continue
+                maximum = self._inflight_stale_limit(job)
                 claimed = job.get("claimed_at")
                 if not claimed:
                     age = maximum + 1
@@ -177,6 +207,7 @@ class ExecutionFoundation:
                     age = (now - parse_time(claimed)).total_seconds()
                 if age > maximum:
                     job["recovered_at"] = iso_now()
+                    job["recovered_after_seconds"] = int(age)
                     job.pop("claimed_at", None)
                     atomic_write_json(self.pending / path.name, job)
                     path.unlink(missing_ok=True)
@@ -184,15 +215,37 @@ class ExecutionFoundation:
         return recovered
 
     def _claim(self) -> tuple[Path, dict[str, Any]] | None:
+        from .lanes import acquire_resource
         now = time.time()
+        self.resource_wait = False
         with exclusive_lock(self.root / ".spool.lock"):
             for source in sorted(self.pending.glob("*.json"), key=lambda p: p.stat().st_mtime):
                 job = read_json(source, {})
+                if action_paused(job.get("action")):
+                    continue
                 if float(job.get("not_before_epoch", 0)) > now:
                     continue
                 if self.receipt_path(job["dedup_key"]).exists():
                     source.unlink(missing_ok=True)
                     continue
+                try:
+                    lease = acquire_resource(self, job)
+                except FoundationError as exc:
+                    if str(exc) != "SINGLE_WORKER_LOCKED":
+                        raise
+                    lease = None
+                if lease is None:
+                    self.resource_wait = True
+                    continue
+                if action_paused(job.get("action")):
+                    # This exact lease was just acquired; no child or claim exists.
+                    from .lanes import release_resource
+                    try:
+                        release_resource(self, lease)
+                    except Exception:
+                        self.resource_wait = True  # Preserve foreign/uncertain lease.
+                    continue
+                job["resource_lease"] = lease
                 destination = self.inflight / source.name
                 job["claimed_at"] = iso_now()
                 job["worker_pid"] = os.getpid()
@@ -208,10 +261,19 @@ class ExecutionFoundation:
         if any(arg not in allowed for arg in supplied):
             raise FoundationError("ARG_NOT_ALLOWED")
         command = [str(item) for item in action["command"]] + supplied
+        if action.get("append_airtable_record_id"):
+            record_id = str((job.get("metadata") or {}).get("airtable_record_id") or "").strip()
+            if not record_id:
+                raise FoundationError("AIRTABLE_RECORD_ID_REQUIRED")
+            command += ["--record-id", record_id]
+        if action.get("append_idempotency_key"):
+            command += ["--request-id", str(job["idempotency_key"])]
         return command, action
 
-    def _external_receipt(self, action: dict[str, Any]) -> dict[str, Any] | None:
+    def _external_receipt(self, action: dict[str, Any], job: dict[str, Any] | None = None) -> dict[str, Any] | None:
         source = action.get("receipt_source")
+        if not source and action.get("receipt_source_dir") and job:
+            source = str(Path(action["receipt_source_dir"]) / f"{job['dedup_key']}.json")
         if not source:
             return None
         path = Path(source)
@@ -220,7 +282,71 @@ class ExecutionFoundation:
         value = read_json(path, {})
         return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "content": value}
 
-    def _retry(self, path: Path, job: dict[str, Any], error: str) -> dict[str, Any]:
+    def _fail_requeue_closed(self, path: Path, job: dict[str, Any], error: str,
+                             original_error: str) -> dict[str, Any]:
+        job["last_error"] = error
+        job["requeue_error"] = original_error
+        job["last_failed_at"] = iso_now()
+        persisted = {key: value for key, value in job.items()
+                     if key != "_resource_release_attempted"}
+        atomic_write_json(self.failed / path.name, persisted)
+        path.unlink(missing_ok=True)
+        self.heartbeat("worker", "IDLE", last_dedup_key=job["dedup_key"])
+        return {"status": "FAILED_REQUEUE_RELEASE", "attempt": int(job.get("attempt", 0)),
+                "error": error, "dedup_key": job["dedup_key"]}
+
+    def _release_before_pending(self, path: Path, job: dict[str, Any], *,
+                                safe_to_release: bool, original_error: str) -> dict[str, Any] | None:
+        if not safe_to_release:
+            return self._fail_requeue_closed(
+                path, job, f"RESOURCE_RELEASE_UNSAFE:{original_error}", original_error)
+        job["_resource_release_attempted"] = True
+        try:
+            from .lanes import release_resource
+            release_resource(self, job.get("resource_lease") or {})
+        except Exception as exc:
+            return self._fail_requeue_closed(
+                path, job, f"RESOURCE_RELEASE_FAILED:{type(exc).__name__}:{exc}", original_error)
+        # A pending job is unowned. It must acquire a fresh token at its next claim.
+        job.pop("resource_lease", None)
+        job.pop("claimed_at", None)
+        job.pop("worker_pid", None)
+        job.pop("_resource_release_attempted", None)
+        return None
+
+    def _defer_external(self, path: Path, job: dict[str, Any], action: dict[str, Any],
+                        *, safe_to_release: bool) -> dict[str, Any]:
+        delay = max(1, int(action.get("external_poll_seconds", 60)))
+        job["not_before_epoch"] = time.time() + delay
+        job["external_wait_started_at"] = job.get("external_wait_started_at") or iso_now()
+        failed = self._release_before_pending(
+            path, job, safe_to_release=safe_to_release, original_error="EXTERNAL_RESULT_PENDING")
+        if failed:
+            return failed
+        atomic_write_json(self.pending / path.name, job)
+        path.unlink(missing_ok=True)
+        self.heartbeat("worker", "IDLE", last_dedup_key=job["dedup_key"])
+        return {
+            "status": "DEFERRED_EXTERNAL",
+            "retry_in_seconds": delay,
+            "dedup_key": job["dedup_key"],
+        }
+
+    def _fail_final(self, path: Path, job: dict[str, Any], error: str,
+                    external: dict[str, Any] | None = None) -> dict[str, Any]:
+        job["attempt"] = int(job.get("attempt", 0)) + 1
+        job["last_error"] = error
+        job["last_failed_at"] = iso_now()
+        if external is not None:
+            job["terminal_external_receipt"] = external
+        atomic_write_json(self.failed / path.name, job)
+        path.unlink(missing_ok=True)
+        self.heartbeat("worker", "IDLE", last_dedup_key=job["dedup_key"])
+        return {"status": "FAILED_FINAL", "attempt": job["attempt"], "error": error,
+                "dedup_key": job["dedup_key"]}
+
+    def _retry(self, path: Path, job: dict[str, Any], error: str,
+               *, safe_to_release: bool) -> dict[str, Any]:
         attempt = int(job.get("attempt", 0)) + 1
         job["attempt"] = attempt
         job["last_error"] = error
@@ -232,10 +358,28 @@ class ExecutionFoundation:
             return {"status": "FAILED_FINAL", "attempt": attempt, "error": error, "dedup_key": job["dedup_key"]}
         delay = int(self.config.get("retry_base_seconds", 15)) * (2 ** (attempt - 1))
         job["not_before_epoch"] = time.time() + delay
+        failed = self._release_before_pending(
+            path, job, safe_to_release=safe_to_release, original_error=error)
+        if failed:
+            return failed
         atomic_write_json(self.pending / path.name, job)
         path.unlink(missing_ok=True)
         return {"status": "RETRY_SPOOLED", "attempt": attempt, "retry_in_seconds": delay,
                 "error": error, "dedup_key": job["dedup_key"]}
+
+    def _hold_reservation(self, job: dict[str, Any], *, no_child_confirmed: bool) -> dict[str, Any]:
+        # Never rewrite/remove pending, inflight, or receipt on cancellation.
+        released = False
+        job["_resource_release_attempted"] = True  # In-memory only; prevent double release.
+        if no_child_confirmed is True:
+            from .lanes import release_resource
+            try:
+                release_resource(self, job.get("resource_lease") or {})
+                released = True
+            except Exception:
+                pass  # No force release: existing owner/token contract remains intact.
+        return {"status": "PAUSED_BY_OWNER", "action": job["action"],
+                "resource_release_safe": released}
 
     def work_once(self) -> dict[str, Any]:
         try:
@@ -244,16 +388,29 @@ class ExecutionFoundation:
                 claimed = self._claim()
                 if claimed is None:
                     self.heartbeat("worker", "IDLE")
-                    return {"status": "IDLE"}
+                    return {"status": "RESOURCE_WAIT" if self.resource_wait else "IDLE"}
                 path, job = claimed
+                launch_stage = "UNKNOWN"
+                safe_to_release = False
                 try:
+                    # The worker owns the exact lease and no child launch has
+                    # been attempted in this try block yet.
+                    launch_stage = "PRELAUNCH_CONFIRMED"
+                    safe_to_release = True
+                    if action_paused(job.get("action")):
+                        return self._hold_reservation(job, no_child_confirmed=True)
                     command, action = self._command(job)
                     if action.get("requires_remote"):
                         raise FoundationError("REMOTE_DEPENDENCY_FORBIDDEN")
                     if action.get("requires_network") and not self._network_ready():
-                        return self._retry(path, job, "NETWORK_UNAVAILABLE")
+                        return self._retry(path, job, "NETWORK_UNAVAILABLE",
+                                           safe_to_release=safe_to_release)
                     if os.environ.get("WEF_FAULT_WORKER_CRASH") == "1":
                         raise FoundationError("INJECTED_WORKER_CRASH")
+                    # subprocess.run may raise after creating a process. From
+                    # this point, absence of a returned result is ambiguous.
+                    launch_stage = "SPAWN_OUTCOME_UNKNOWN"
+                    safe_to_release = False
                     completed = subprocess.run(
                         command,
                         cwd=action.get("working_directory"),
@@ -263,19 +420,57 @@ class ExecutionFoundation:
                         errors="replace",
                         timeout=int(action.get("timeout_seconds", 900)),
                         check=False,
+                        creationflags=CREATE_NO_WINDOW if os.name == "nt" else 0,
                     )
+                    launch_stage = "SPAWN_RETURNED"
+                    if (job.get("action") == "cityheaven-reservation-schedule"
+                            and completed.returncode == 30):
+                        safe_to_release = False
+                        notice = parse_pause_notice(completed.stdout, "parent")
+                        return self._hold_reservation(
+                            job, no_child_confirmed=notice is not None and notice["no_child_confirmed"] is True)
+                    external = self._external_receipt(action, job)
+                    content = (external or {}).get("content") or {}
+                    safe_to_release = job["action"] != "codex-local-job" or (
+                        completed.returncode == 0 and content.get("request_id") == job["idempotency_key"]
+                        and content.get("resource_release_safe") is True)
+                    if not self.config.get("shared_resource_dir"):
+                        safe_to_release = True
                     if completed.returncode != 0:
-                        return self._retry(path, job, f"EXIT_{completed.returncode}:{completed.stderr[-1000:]}")
-                    external = self._external_receipt(action)
+                        error = f"EXIT_{completed.returncode}"
+                        if not action.get("redact_subprocess_output"):
+                            error += f":{completed.stderr[-1000:]}"
+                        if completed.returncode in set(action.get("terminal_failure_exit_codes", [])):
+                            return self._fail_final(path, job, error, external)
+                        return self._retry(path, job, error, safe_to_release=safe_to_release)
+                    if action.get("external_async") and external is None:
+                        return self._defer_external(path, job, action,
+                                                    safe_to_release=safe_to_release)
                     if action.get("receipt_source") and external is None:
-                        return self._retry(path, job, "EXTERNAL_RECEIPT_MISSING")
+                        return self._retry(path, job, "EXTERNAL_RECEIPT_MISSING",
+                                           safe_to_release=safe_to_release)
+                    if action.get("receipt_source_dir") and external is None:
+                        return self._retry(path, job, "EXTERNAL_RECEIPT_MISSING",
+                                           safe_to_release=safe_to_release)
+                    if action.get("receipt_request_id_field"):
+                        content = external.get("content") if external else None
+                        if not isinstance(content, dict) or content.get(action["receipt_request_id_field"]) != job["idempotency_key"]:
+                            return self._retry(path, job, "EXTERNAL_RECEIPT_REQUEST_MISMATCH",
+                                               safe_to_release=safe_to_release)
                     receipt = {
                         "schema_version": "1.0",
+                        "lane_id": self.config.get("lane_id", "A"),
                         "status": "SUCCESS",
                         "job_id": job["job_id"],
                         "action": job["action"],
                         "idempotency_key": job["idempotency_key"],
                         "dedup_key": job["dedup_key"],
+                        **({"work_number": job["metadata"]["work_number"]}
+                           if (job.get("metadata") or {}).get("work_number") else {}),
+                        **({key: job["metadata"][key] for key in (
+                            "work_identity_key", "display_name_ja", "stage_key", "completion_scope",
+                            "existing_action_id", "existing_work_number",
+                        ) if (job.get("metadata") or {}).get(key) is not None}),
                         "completed_at": iso_now(),
                         "attempt": int(job.get("attempt", 0)) + 1,
                         "exit_code": completed.returncode,
@@ -288,29 +483,76 @@ class ExecutionFoundation:
                     self.heartbeat("worker", "IDLE", last_dedup_key=job["dedup_key"])
                     return receipt
                 except subprocess.TimeoutExpired as exc:
-                    return self._retry(path, job, f"TIMEOUT:{exc.timeout}")
+                    return self._retry(path, job, f"TIMEOUT:{exc.timeout}",
+                                       safe_to_release=False)
                 except Exception as exc:
-                    return self._retry(path, job, f"{type(exc).__name__}:{exc}")
+                    return self._retry(path, job, f"{type(exc).__name__}:{exc}",
+                                       safe_to_release=(
+                                           launch_stage == "PRELAUNCH_CONFIRMED"
+                                           and safe_to_release
+                                       ))
+                finally:
+                    if (launch_stage in {"PRELAUNCH_CONFIRMED", "SPAWN_RETURNED"}
+                            and safe_to_release
+                            and not job.get("_resource_release_attempted")):
+                        from .lanes import release_resource
+                        release_resource(self, job.get("resource_lease") or {})
         except FoundationError as exc:
             if str(exc) == "SINGLE_WORKER_LOCKED":
                 return {"status": "NOOP_SINGLE_WORKER"}
             raise
 
     def watchdog(self, *, restart: bool = True) -> dict[str, Any]:
-        recovered = self.recover_stale()
         worker = read_json(self.heartbeats / "worker.json", {})
-        maximum = int(self.config.get("worker_heartbeat_max_age_seconds", 120))
+        maximum = int(self.config.get("worker_heartbeat_max_age_seconds", 900))
         stale = True
+        heartbeat_age = None
         if worker.get("observed_at"):
-            stale = (datetime.now(UTC) - parse_time(worker["observed_at"])).total_seconds() > maximum
+            heartbeat_age = (datetime.now(UTC) - parse_time(worker["observed_at"])).total_seconds()
+            stale = heartbeat_age > maximum
+
+        recovered = 0
         restart_result = "NOT_NEEDED"
-        if stale and restart and os.name == "nt" and self.config.get("worker_task_name"):
-            result = subprocess.run(["schtasks.exe", "/run", "/tn", self.config["worker_task_name"]],
-                                    capture_output=True, text=True, check=False)
-            restart_result = "TRIGGERED" if result.returncode == 0 else f"FAILED:{result.returncode}"
-        value = self.heartbeat("watchdog", "HEALTHY" if not stale else "WORKER_STALE",
-                               recovered_inflight=recovered, restart_result=restart_result)
+        worker_lock_held = False
+        status = "HEALTHY"
+
+        if stale:
+            try:
+                with exclusive_lock(self.root / ".worker.lock"):
+                    recovered = self.recover_stale()
+            except FoundationError as exc:
+                if str(exc) != "SINGLE_WORKER_LOCKED":
+                    raise
+                worker_lock_held = True
+                status = "WORKER_BUSY_STALE_HEARTBEAT"
+                restart_result = "DEFERRED_LOCK_HELD"
+            else:
+                status = "WORKER_STALE"
+                if restart and os.name == "nt" and self.config.get("worker_task_name"):
+                    result = subprocess.run(
+                        ["schtasks.exe", "/run", "/tn", self.config["worker_task_name"]],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                    restart_result = "TRIGGERED" if result.returncode == 0 else f"FAILED:{result.returncode}"
+
+        value = self.heartbeat(
+            "watchdog",
+            status,
+            recovered_inflight=recovered,
+            restart_result=restart_result,
+            worker_lock_held=worker_lock_held,
+        )
         value["worker_stale"] = stale
+        try:
+            from .lane_monitor import watchdog_alert
+            alerts = watchdog_alert(self, value, heartbeat_age)
+            if alerts:
+                value["alerts"] = alerts
+        except Exception as exc:  # Alerting must never break the watchdog.
+            value["alert_error"] = type(exc).__name__
         return value
 
     def audit(self) -> dict[str, Any]:

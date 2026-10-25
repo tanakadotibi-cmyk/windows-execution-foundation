@@ -1,0 +1,2 @@
+"C:\Users\epuro\AppData\Local\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9227 --user-data-dir=C:\Users\epuro\CityHeavenAI\ReservationRuntimeChromeProfile --profile-directory=Default --no-first-run --no-default-browser-check --restore-last-session
+(pid 32636, started 2026-10-21 12:21:52 JST via one-shot task TantanX-CityReservationChrome9227-Restart-Once)

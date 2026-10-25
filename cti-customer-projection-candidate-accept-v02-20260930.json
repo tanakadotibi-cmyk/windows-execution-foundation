@@ -1,0 +1,173 @@
+{
+  "candidate_files": [
+    "local/cti-customer-deterministic-projection-v01-20260930/candidate/cti_customer_projection.py",
+    "local/cti-customer-deterministic-projection-v01-20260930/candidate/cti_daily_collector.py",
+    "local/cti-customer-deterministic-projection-v01-20260930/candidate/bridge_watcher.py"
+  ],
+  "candidate_sha256": {
+    "bridge_watcher.py": "268179d87f797a5b3b580389cbe2a3d1e54279169b2494afc5be05d06b8fbb78",
+    "cti_customer_projection.py": "da03016ef6ee9dd44bd9bfdd086a4e6d95b9266940eaccd08432e67316db4848",
+    "cti_daily_collector.py": "cb217723ec68afb65e5d29c31fb9ebc48e787c22cda9348558e95c06390b4a2a"
+  },
+  "diff_scope": {
+    "classification": "CUSTOMER_PROJECTION_AND_EXISTING_CUSTOMER_WRITER_CONNECTION_ONLY",
+    "comparison_basis": "candidate versus immutable pre-job production snapshots in backup/*.before; projection is a new candidate-only module",
+    "files": {
+      "bridge_watcher.py": {
+        "changed_functions": [
+          "apply_pending_cti_daily"
+        ],
+        "new_functions": [
+          "_cti_customer_chunks",
+          "_cti_customer_iso",
+          "_cti_customer_later",
+          "_cti_customer_records_by_dedup",
+          "_cti_customer_sources",
+          "apply_cti_customer_projection"
+        ]
+      },
+      "cti_daily_collector.py": {
+        "changed_functions": [
+          "apply_canonical_writer_once",
+          "build_daily_facts",
+          "run"
+        ],
+        "new_functions": [
+          "is_completed_service_reservation"
+        ]
+      }
+    },
+    "production_edit_count": 0,
+    "status": "PASS"
+  },
+  "failures": [],
+  "fixture_cases": [
+    {
+      "case": "same_input_deterministic_and_pii_free",
+      "customer_id": "cus_cti_8265dd9ce3cf7340a4a608a5",
+      "entity_count": 1,
+      "entity_dedup_key": "cti-native-customer-v1:8265dd9ce3cf7340a4a608a5540730ea5d0011cfc973c74c02de18a6d8995074",
+      "journey_count": 1,
+      "journey_dedup_key": "cti-journey-v1:60b0cd76fc60adb9034f063a4ba0b60e1ab6cf9be1c1e03d72b15b6df445f3c6",
+      "journey_event_id": "cje_60b0cd76fc60adb9034f063a",
+      "status": "PASS"
+    },
+    {
+      "case": "outside_shop",
+      "entity_count": 0,
+      "journey_count": 0,
+      "status": "PASS"
+    },
+    {
+      "case": "missing_user",
+      "entity_count": 0,
+      "journey_count": 0,
+      "status": "PASS"
+    },
+    {
+      "case": "unfinished_service",
+      "entity_count": 1,
+      "journey_count": 0,
+      "status": "PASS"
+    },
+    {
+      "case": "completed_service",
+      "entity_count": 1,
+      "journey_count": 1,
+      "status": "PASS"
+    },
+    {
+      "amount_jpy": null,
+      "case": "nonnumeric_amount_not_emitted_as_number",
+      "status": "PASS"
+    },
+    {
+      "case": "offline_writer_existing_entity_and_replay",
+      "dedup_entity_new_write_count": 0,
+      "first_journey_new_count": 1,
+      "first_seen_preserved": true,
+      "last_seen_is_max": true,
+      "linked_record_id": "recResolvedCustomer001",
+      "replay_journey_new_count": 0,
+      "replay_new_write_count": 0,
+      "status": "PASS"
+    }
+  ],
+  "next_step": "Use a separate explicitly approved promotion job to apply these three candidate files; do not promote in this job.",
+  "pii_scan": {
+    "forbidden_key_count": 0,
+    "raw_pii_value_hit_count": 0,
+    "status": "PASS"
+  },
+  "production_sha256": {
+    "bridge_watcher.py": "e3e5002ae49d499700934e7c8f59a92ff620804c170f3cce6d1b39f0c7127b8e",
+    "cti_customer_projection.py": null,
+    "cti_daily_collector.py": "83813d0bee3ea9f821e688326c900d67035aac15027246fb8a6b4347a9e05e91"
+  },
+  "production_sha256_note": "projection module absent from pre-job production snapshot; other hashes are immutable .before snapshots",
+  "promote_ready": true,
+  "py_compile": {
+    "files": {
+      "bridge_watcher.py": "PASS",
+      "cti_customer_projection.py": "PASS",
+      "cti_daily_collector.py": "PASS"
+    },
+    "python": "C:\\Users\\epuro\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+    "status": "PASS"
+  },
+  "replay_counts": {
+    "entity_new_first": 0,
+    "entity_new_replay": 0,
+    "entity_update_replay": 0,
+    "journey_new_first": 1,
+    "journey_new_replay": 0,
+    "journey_replay": 1
+  },
+  "reused_candidate": true,
+  "side_effect_counts": {
+    "airtable_live_write": 0,
+    "cdp": 0,
+    "cti_browser": 0,
+    "network": 0,
+    "new_credential": 0,
+    "new_database": 0,
+    "new_field": 0,
+    "new_secret": 0,
+    "new_service": 0,
+    "new_table": 0,
+    "new_task": 0,
+    "new_watcher": 0,
+    "offline_stub_write_calls_first_pass": 3,
+    "offline_stub_write_calls_replay": 0,
+    "production_source_edit": 0,
+    "unknown_to_zero": 0
+  },
+  "status": "PASS",
+  "text_integrity": {
+    "files": {
+      "bridge_watcher.py": {
+        "baseline_trailing_whitespace_lines": 1,
+        "final_newline": true,
+        "introduced_trailing_whitespace_lines": 0,
+        "mixed_newlines": false,
+        "trailing_whitespace_lines": 1
+      },
+      "cti_customer_projection.py": {
+        "baseline_trailing_whitespace_lines": 0,
+        "final_newline": true,
+        "introduced_trailing_whitespace_lines": 0,
+        "mixed_newlines": false,
+        "trailing_whitespace_lines": 0
+      },
+      "cti_daily_collector.py": {
+        "baseline_trailing_whitespace_lines": 0,
+        "final_newline": true,
+        "introduced_trailing_whitespace_lines": 0,
+        "mixed_newlines": false,
+        "trailing_whitespace_lines": 0
+      }
+    },
+    "git_diff_check": "NOT_APPLICABLE_NO_REPO",
+    "status": "PASS"
+  }
+}
