@@ -1,0 +1,19 @@
+{
+  "record_kind": "schedule_discrepancy",
+  "applied_to_machine": false,
+  "install_script_modified": false,
+  "repository_definition": {
+    "file": "install-windows.ps1",
+    "worker_trigger_line": 55,
+    "worker_trigger_text": "$WorkerTriggers = @((New-ScheduledTaskTrigger -AtLogOn -User $CurrentUser), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)))",
+    "watchdog_trigger_line": 56,
+    "watchdog_trigger_text": "$WatchdogTriggers = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)))",
+    "repetition_interval_minutes": 1
+  },
+  "machine_report": {
+    "source": "ai-team-hub issue 107, from DOT audit issue 48",
+    "reported_repetition_interval_minutes": 5,
+    "note": "The five-minute figure is the report cited by the issue. This prototype did not query the machine and did not change its tasks."
+  },
+  "reconciliation_procedure": "docs/windows-schedule-reconciliation.md"
+}

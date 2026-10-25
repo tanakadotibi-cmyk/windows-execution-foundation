@@ -4,6 +4,7 @@
   "state_dir": "C:\\ProgramData\\WindowsExecutionFoundation",
   "worker_heartbeat_max_age_seconds": 120,
   "inflight_stale_seconds": 300,
+  "pending_allowed_delay_seconds": 900,
   "max_attempts": 5,
   "retry_base_seconds": 15,
   "network_probe_url": "https://example.com/",

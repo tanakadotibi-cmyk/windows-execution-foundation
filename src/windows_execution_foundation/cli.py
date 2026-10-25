@@ -3,8 +3,39 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
 from .core import ExecutionFoundation
+
+# Zero means the outcome is complete or there was nothing to do.
+# Every other operator-visible state has its own code so a caller can tell
+# a retry, an unknown effect, a final failure, an audit failure, and a dead
+# worker apart. Unknown statuses fail closed with 1.
+EXIT_CODES: dict[str, int] = {
+    "SUCCESS": 0,
+    "ENQUEUED": 0,
+    "NOOP_RECEIPT": 0,
+    "NOOP_QUEUED": 0,
+    "IDLE": 0,
+    "HEALTHY": 0,
+    "PASS": 0,
+    "NOOP_SINGLE_WORKER": 0,
+    "RETRY_SPOOLED": 10,
+    "RESULT_UNKNOWN": 11,
+    "FAILED_FINAL": 12,
+    "ATTENTION": 13,
+    "WORKER_STALE": 14,
+    "WORKER_UNRESPONSIVE": 15,
+    "DROPPED_BEFORE_LOCAL_RECEIPT": 16,
+    "NOOP_UNKNOWN": 17,
+}
+
+
+def exit_code_for(result: dict[str, Any]) -> int:
+    status = str(result.get("status") or "")
+    if status not in EXIT_CODES:
+        return 1
+    return EXIT_CODES[status]
 
 
 def main() -> int:
@@ -30,4 +61,4 @@ def main() -> int:
     else:
         result = foundation.audit()
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if result.get("status") not in {"FAILED_FINAL", "ATTENTION"} else 2
+    return exit_code_for(result)
