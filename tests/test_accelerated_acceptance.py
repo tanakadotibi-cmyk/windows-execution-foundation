@@ -19,12 +19,22 @@ class AcceleratedAcceptanceTests(unittest.TestCase):
         self.receipt_source = self.root / "external.json"
         self.helper = self.root / "helper.py"
         self.helper.write_text(
+            "import json, os, sys\n"
+            "from datetime import UTC, datetime\n"
             "from pathlib import Path\n"
-            "import json,sys\n"
-            "counter=Path(sys.argv[1]); receipt=Path(sys.argv[2])\n"
-            "n=int(counter.read_text() if counter.exists() else '0')+1\n"
+            "counter = Path(sys.argv[1])\n"
+            "n = int(counter.read_text() if counter.exists() else '0') + 1\n"
             "counter.write_text(str(n))\n"
-            "receipt.write_text(json.dumps({'status':'PUBLISHED_VERIFIED','site_article_id':'53957062'}))\n",
+            "receipt = Path(os.environ['WEF_RECEIPT_PATH'])\n"
+            "receipt.parent.mkdir(parents=True, exist_ok=True)\n"
+            "generated = datetime.now(UTC).isoformat(timespec='milliseconds').replace('+00:00', 'Z')\n"
+            "receipt.write_text(json.dumps({\n"
+            "    'execution_id': os.environ['WEF_EXECUTION_ID'],\n"
+            "    'target': os.environ['WEF_ACTION'],\n"
+            "    'status': 'PUBLISHED_VERIFIED',\n"
+            "    'generated_at': generated,\n"
+            "    'site_article_id': '53957062',\n"
+            "}))\n",
             encoding="utf-8",
         )
         self.config = {
@@ -62,7 +72,11 @@ class AcceleratedAcceptanceTests(unittest.TestCase):
         claimed = self.foundation._claim()
         self.assertIsNotNone(claimed)
         path, job = claimed
-        job["claimed_at"] = "2000-01-01T00:00:00Z"
+        job["claimed_at"] = "2000-01-01T00:00:00.000Z"
+        job["heartbeat_at"] = "2000-01-01T00:00:00.000Z"
+        job["lease_until"] = "2000-01-01T00:00:00.000Z"
+        job["worker_pid"] = 2**30
+        job["owner_proc_start"] = "not-a-live-process"
         atomic_write_json(path, job)
         self.assertEqual(1, self.foundation.recover_stale())
         with mock.patch.object(self.foundation, "_network_ready", return_value=True):
@@ -93,6 +107,10 @@ class AcceleratedAcceptanceTests(unittest.TestCase):
         self.assertEqual(0, audit["duplicate_receipts"])
         self.assertEqual(1.0, audit["receipt_coverage"])
         self.assertEqual([], audit["remote_required_actions"])
+        self.assertEqual("PASS", audit["queue_delay"]["status"])
+        self.assertIsNone(audit["queue_delay"]["oldest_waiting_at"])
+        self.assertEqual("PASS", audit["identifier_reconciliation"]["status"])
+        self.assertEqual(3, audit["identifier_reconciliation"]["matched"])
 
 
 if __name__ == "__main__":

@@ -3,4 +3,4 @@
 from .core import ExecutionFoundation, FoundationError
 
 __all__ = ["ExecutionFoundation", "FoundationError"]
-__version__ = "1.0.0"
+__version__ = "1.1.0"
