@@ -902,14 +902,19 @@ class ExecutionFoundation:
 
         execution_ids: list[str] = []
         receipts_by_execution: dict[str, dict[str, Any]] = {}
+        # Unreadable execution receipts cannot be matched. They stay in the
+        # orphan scan so a corrupt file with no done record cannot pass.
+        unreadable_execution_ids: list[str] = []
         for path in execution_paths:
             try:
                 receipt = read_json(path, {})
             except (json.JSONDecodeError, OSError):
                 execution_ids.append(path.stem)
+                unreadable_execution_ids.append(path.stem)
                 continue
             if not isinstance(receipt, dict):
                 execution_ids.append(path.stem)
+                unreadable_execution_ids.append(path.stem)
                 continue
             execution_ids.append(str(receipt.get("execution_id") or path.stem))
             receipts_by_execution[path.stem] = receipt
@@ -919,30 +924,36 @@ class ExecutionFoundation:
         allowed = int(self.config.get("pending_allowed_delay_seconds", DEFAULT_PENDING_ALLOWED_DELAY_SECONDS))
         oldest: datetime | None = None
         overdue: list[Any] = []
+        unprocessable_pending: list[str] = []
         eligible = 0
         ineligible = 0
         for path in pending_paths:
             try:
                 job = read_json(path, {})
             except (json.JSONDecodeError, OSError):
-                overdue.append(path.stem)
+                unprocessable_pending.append(path.stem)
                 continue
             if not isinstance(job, dict):
+                unprocessable_pending.append(path.stem)
                 continue
-            not_before = float(job.get("not_before_epoch") or 0)
+            try:
+                not_before = float(job.get("not_before_epoch") or 0)
+            except (TypeError, ValueError):
+                unprocessable_pending.append(path.stem)
+                continue
             if not_before > time.time():
                 ineligible += 1
                 continue
             eligible += 1
             start = self._eligible_since(job, not_before)
             if start is None:
-                overdue.append(job.get("execution_id"))
+                overdue.append(job.get("execution_id") or path.stem)
                 continue
             if oldest is None or start < oldest:
                 oldest = start
             if (now - start).total_seconds() > allowed:
-                overdue.append(job.get("execution_id"))
-        queue_status = "PASS" if not overdue else "ATTENTION"
+                overdue.append(job.get("execution_id") or path.stem)
+        queue_status = "PASS" if not overdue and not unprocessable_pending else "ATTENTION"
         oldest_wait = 0.0 if oldest is None else (now - oldest).total_seconds()
 
         mismatches: list[dict[str, Any]] = []
@@ -968,7 +979,10 @@ class ExecutionFoundation:
                 matched += 1
             else:
                 mismatches.append({"execution_id": execution_id, "dedup_key": job.get("dedup_key")})
-        orphans = [execution_id for execution_id in receipts_by_execution if execution_id not in seen_execution]
+        orphan_candidates = list(receipts_by_execution) + [
+            execution_id for execution_id in unreadable_execution_ids if execution_id not in receipts_by_execution
+        ]
+        orphans = [execution_id for execution_id in orphan_candidates if execution_id not in seen_execution]
         identifier_status = "PASS" if not mismatches and not orphans else "ATTENTION"
         coverage = 1.0 if not done_paths else matched / len(done_paths)
         structural_ok = not inflight and not failed and not unknown and duplicate_receipts == 0
@@ -995,6 +1009,7 @@ class ExecutionFoundation:
                 "oldest_wait_seconds": oldest_wait,
                 "allowed_delay_seconds": allowed,
                 "overdue_count": len(overdue),
+                "unprocessable_pending": unprocessable_pending,
             },
             "identifier_reconciliation": {
                 "status": identifier_status,

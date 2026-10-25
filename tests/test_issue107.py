@@ -534,6 +534,23 @@ time.sleep(5)
         self.assertEqual(0, broken["identifier_reconciliation"]["matched"])
         self.assertEqual(0.0, broken["receipt_coverage"])
 
+    def test_unprocessable_pending_fails_the_audit(self):
+        (self.foundation.pending / "not-a-job.json").write_text("[]\n", encoding="utf-8")
+        audit = self.foundation.audit()
+        self.assertEqual("ATTENTION", audit["status"])
+        self.assertEqual("ATTENTION", audit["queue_delay"]["status"])
+        self.assertIn("not-a-job", audit["queue_delay"]["unprocessable_pending"])
+        self.assertEqual("PASS", audit["identifier_reconciliation"]["status"])
+
+    def test_unreadable_execution_receipt_is_an_orphan(self):
+        broken = self.foundation.execution_receipt_path("broken-exec")
+        broken.write_text("{", encoding="utf-8")
+        audit = self.foundation.audit()
+        self.assertEqual("ATTENTION", audit["status"])
+        self.assertEqual("ATTENTION", audit["identifier_reconciliation"]["status"])
+        self.assertIn("broken-exec", audit["identifier_reconciliation"]["orphan_execution_ids"])
+        self.assertEqual("PASS", audit["queue_delay"]["status"])
+
     def test_orphan_receipt_fails_the_identifier_check(self):
         atomic_write_json(
             self.foundation.execution_receipt_path("orphan-exec"),
