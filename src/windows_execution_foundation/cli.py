@@ -7,8 +7,31 @@ from typing import Any
 
 from .airtable_local_exec import LocalExecError, run_after_work, run_before_work
 from .core import (
-    ExecutionFoundation, FoundationError, atomic_write_json, exclusive_lock, iso_now,
+    RESULT_UNKNOWN, ExecutionFoundation, FoundationError, atomic_write_json, exclusive_lock, iso_now,
 )
+
+# Exit codes are state-specific. A local-exec reason still forces attention (2).
+_EXIT_CODES = {
+    "SUCCESS": 0,
+    "IDLE": 0,
+    "HEALTHY": 0,
+    "PASS": 0,
+    "DRAINED": 0,
+    "ENQUEUED": 0,
+    "NOOP_RECEIPT": 0,
+    "NOOP_QUEUED": 0,
+    "NOOP_SINGLE_WORKER": 0,
+    "RESOURCE_WAIT": 0,
+    "DEFERRED_EXTERNAL": 0,
+    "RETRY_SPOOLED": 0,
+    "PAUSED_BY_OWNER": 0,
+    RESULT_UNKNOWN: 1,
+    "FAILED_FINAL": 2,
+    "FAILED_REQUEUE_RELEASE": 2,
+    "ATTENTION": 2,
+    "WORKER_STALE": 3,
+    "WORKER_BUSY_STALE_HEARTBEAT": 3,
+}
 
 def _enabled_local_exec(foundation: ExecutionFoundation) -> dict[str, Any] | None:
     config = foundation.config.get("local_exec_airtable")
@@ -65,6 +88,23 @@ def _apply_local_exec_reason(result: dict[str, Any], errors: list[dict[str, Any]
         result["local_exec_record_write_error"] = record_error
 
 
+# A multi-job drain must not hide a closed failure or an unknown result behind DRAINED.
+_DRAIN_STATUS_PRIORITY = (
+    "FAILED_FINAL",
+    "FAILED_REQUEUE_RELEASE",
+    RESULT_UNKNOWN,
+    "ATTENTION",
+)
+
+
+def _drain_summary_status(outcomes: list[dict[str, Any]]) -> str:
+    present = {str(item.get("status") or "") for item in outcomes}
+    for status in _DRAIN_STATUS_PRIORITY:
+        if status in present:
+            return status
+    return "DRAINED"
+
+
 def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, Any]:
     """Serialize ingestion as well as execution within a lane; drain at most two.
 
@@ -82,7 +122,7 @@ def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, 
                 if config:
                     result["local_exec"] = {"before": before, "after": after}
                 outcomes.append(result)
-                if result["status"] in {"IDLE", "RESOURCE_WAIT", "NOOP_SINGLE_WORKER"}:
+                if result["status"] in {"IDLE", "RESOURCE_WAIT", "NOOP_SINGLE_WORKER", RESULT_UNKNOWN}:
                     break
     except FoundationError as exc:
         if str(exc) != "SINGLE_WORKER_LOCKED":
@@ -98,7 +138,8 @@ def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, 
     if max_jobs == 1:
         _apply_local_exec_reason(outcomes[0], errors, record_error)
         return outcomes[0]
-    summary = {"status": "FAILED_FINAL" if any(x["status"] == "FAILED_FINAL" for x in outcomes) else "DRAINED",
+    summary_status = _drain_summary_status(outcomes)
+    summary = {"status": summary_status,
                "lane_id": foundation.config.get("lane_id", "A"), "outcomes": outcomes}
     _apply_local_exec_reason(summary, errors, record_error)
     return summary
@@ -132,11 +173,16 @@ def main() -> int:
     return _finish(result)
 
 def _finish(result: dict[str, Any]) -> int:
-    """Print the cycle result and exit. A local-exec reason stays in the output and the status."""
+    """Print the cycle result and exit with a code for that state.
+
+    0 is a completed, waiting, or healthy state. 1 is 結果不明 and is not resent.
+    2 is a final failure, audit attention, or a local-exec reason. 3 is a worker
+    whose heartbeat expired and whose process is not alive.
+    """
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    if result.get("status") in {"FAILED_FINAL", "ATTENTION"} or result.get("local_exec_reason_code"):
+    if result.get("local_exec_reason_code"):
         return 2
-    return 0
+    return _EXIT_CODES.get(str(result.get("status") or ""), 2)
 
 if __name__ == "__main__":
     raise SystemExit(main())

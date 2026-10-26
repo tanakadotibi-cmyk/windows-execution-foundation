@@ -120,6 +120,7 @@ def process_info(pid: Any) -> dict[str, Any]:
     k32.OpenProcess.restype = wintypes.HANDLE
     k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    k32.GetExitCodeProcess.restype = wintypes.BOOL
     k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
     k32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
                                                ctypes.POINTER(wintypes.DWORD))
