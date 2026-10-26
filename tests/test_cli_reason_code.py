@@ -99,6 +99,58 @@ class CliReasonCodeTests(unittest.TestCase):
         self.assertEqual(printed["local_exec_record_write_error"], "OSError")
         self.assertNotIn("monitoring directory", buffer.getvalue())
 
+    def test_two_jobs_keep_each_result_and_reason_when_record_write_fails(self):
+        jobs = [
+            {"status": "SUCCESS", "job_id": "job-1"},
+            {"status": "SUCCESS", "job_id": "job-2"},
+        ]
+        with mock.patch(
+            "windows_execution_foundation.cli.run_before_work",
+            side_effect=[LocalExecError("REQUEST_EXPIRED"), LocalExecError("AIRTABLE_HTTP_403")],
+        ), mock.patch(
+            "windows_execution_foundation.cli.run_after_work",
+            side_effect=[LocalExecError("WORK_NUMBER_MISMATCH"), LocalExecError("REQUEST_ID_MISMATCH")],
+        ), mock.patch.object(self.foundation, "work_once", side_effect=jobs), mock.patch(
+            "windows_execution_foundation.cli.atomic_write_json",
+            side_effect=OSError("monitoring directory is not writable"),
+        ):
+            result = work_cycle(self.foundation, 2)
+        self.assertEqual(result["status"], "DRAINED")
+        self.assertEqual(
+            [(item["job_id"], item["status"]) for item in result["outcomes"]],
+            [("job-1", "SUCCESS"), ("job-2", "SUCCESS")],
+        )
+        self.assertEqual(
+            [item["local_exec"]["before"]["reason_code"] for item in result["outcomes"]],
+            ["REQUEST_EXPIRED", "AIRTABLE_HTTP_403"],
+        )
+        self.assertEqual(
+            [item["local_exec"]["after"]["reason_code"] for item in result["outcomes"]],
+            ["WORK_NUMBER_MISMATCH", "REQUEST_ID_MISMATCH"],
+        )
+        self.assertEqual(result["local_exec_record_write_error"], "OSError")
+        self.assertFalse((self.foundation.root / "monitoring" / "local-exec-error.json").exists())
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            code = _finish(result)
+        printed = json.loads(buffer.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(len(printed["outcomes"]), 2)
+        self.assertEqual(
+            [(item["job_id"], item["status"]) for item in printed["outcomes"]],
+            [("job-1", "SUCCESS"), ("job-2", "SUCCESS")],
+        )
+        self.assertEqual(
+            [item["local_exec"]["before"]["reason_code"] for item in printed["outcomes"]],
+            ["REQUEST_EXPIRED", "AIRTABLE_HTTP_403"],
+        )
+        self.assertEqual(
+            [item["local_exec"]["after"]["reason_code"] for item in printed["outcomes"]],
+            ["WORK_NUMBER_MISMATCH", "REQUEST_ID_MISMATCH"],
+        )
+        self.assertEqual(printed["local_exec_record_write_error"], "OSError")
+        self.assertNotIn("monitoring directory", buffer.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
