@@ -419,6 +419,13 @@ class OwnershipDeadlineTests(GuaranteeTest):
         self.assertEqual(os.getpid(), seen["job"]["worker_pid"])
 
     def test_watchdog_does_not_treat_a_living_process_as_stale(self):
+        from windows_execution_foundation.lane_monitor import _PYTHON_IMAGE, process_info
+
+        current = process_info(os.getpid())
+        self.assertTrue(current["alive"], current)
+        self.assertEqual("ok", current["access"], current)
+        image = os.path.basename(str(current.get("image") or ""))
+        self.assertIsNotNone(_PYTHON_IMAGE.fullmatch(image), image)
         foundation = self.foundation(worker_heartbeat_max_age_seconds=120)
         self.inflight(foundation, "busy", worker_pid=os.getpid(), claimed_at="2000-01-01T00:00:00Z")
         atomic_write_json(foundation.heartbeats / "worker.json", {
@@ -428,7 +435,7 @@ class OwnershipDeadlineTests(GuaranteeTest):
             "pid": os.getpid(),
         })
         result = foundation.watchdog(restart=False)
-        self.assertEqual("HEALTHY", result["status"])
+        self.assertEqual("HEALTHY", result["status"], result)
         self.assertFalse(result["worker_stale"])
         self.assertEqual(0, result["recovered_inflight"])
         self.assertTrue((foundation.inflight / f"{stable_key('busy')}.json").exists())

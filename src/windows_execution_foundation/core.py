@@ -596,19 +596,44 @@ class ExecutionFoundation:
             return None
         return (datetime.now(UTC) - parsed).total_seconds()
 
-    def _pid_running_since(self, pid: Any, since: Any) -> bool:
-        """True when pid is a live Python process that is not a reuse after `since`."""
+    def _process_probe(self, pid: Any) -> dict[str, Any]:
+        """Liveness without os.kill. Windows uses OpenProcess and GetExitCodeProcess."""
+        from .lane_monitor import process_info
+        return process_info(pid)
+
+    def _python_image(self, info: dict[str, Any]) -> bool:
+        from .lane_monitor import _PYTHON_IMAGE
+        image = os.path.basename(str(info.get("image") or ""))
+        return bool(_PYTHON_IMAGE.fullmatch(image))
+
+    def _living_python_process(self, pid: Any) -> bool:
+        """True when pid is a running Python process right now.
+
+        Heartbeat age and process start time are not part of this answer.
+        On Windows, process_info uses OpenProcess plus GetExitCodeProcess.
+        os.kill(pid, 0) is not used there. A probe that cannot be completed
+        stays fail-closed (treated as living) so a worker is not taken for dead.
+        """
         try:
-            from .lane_monitor import _PYTHON_IMAGE, _epoch, process_info
-            info = process_info(pid)
+            info = self._process_probe(pid)
         except Exception:
-            return True  # Cannot prove the owner is gone.
+            return True
         if info.get("access") == "denied":
             return True
         if not info.get("alive"):
             return False
-        image = os.path.basename(info.get("image") or "")
-        if not _PYTHON_IMAGE.fullmatch(image):
+        return self._python_image(info)
+
+    def _pid_running_since(self, pid: Any, since: Any) -> bool:
+        """True when pid is a live Python process that is not a reuse after `since`."""
+        try:
+            from .lane_monitor import _epoch
+            info = self._process_probe(pid)
+        except Exception:
+            return True  # Cannot prove the owner is gone.
+        if info.get("access") == "denied":
+            return True
+        if not info.get("alive") or not self._python_image(info):
             return False
         created = info.get("created")
         since_epoch = _epoch(since)
@@ -1016,9 +1041,11 @@ class ExecutionFoundation:
         if worker.get("observed_at"):
             heartbeat_age = (datetime.now(UTC) - parse_time(worker["observed_at"])).total_seconds()
             heartbeat_expired = heartbeat_age > maximum
-        # A 120s monitor window must not declare a living owner dead.
-        process_alive = bool(worker.get("pid")) and self._pid_running_since(
-            worker.get("pid"), worker.get("observed_at"))
+        # A stale timestamp must not retire a Python process that is still running.
+        # Comparing the Windows process-start time with an older heartbeat made
+        # this test process look reused, because Windows can see the start time
+        # and Linux cannot. Lease reclaim still rejects a start after the claim.
+        process_alive = bool(worker.get("pid")) and self._living_python_process(worker.get("pid"))
         stale = heartbeat_expired and not process_alive
 
         recovered = 0
