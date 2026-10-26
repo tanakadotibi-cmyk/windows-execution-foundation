@@ -5,10 +5,12 @@ import os
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from unittest import mock
+from contextlib import redirect_stdout
 
-from windows_execution_foundation.cli import _finish
+from windows_execution_foundation.cli import _finish, work_cycle
 from windows_execution_foundation.core import (
     RESULT_UNKNOWN,
     ExecutionFoundation,
@@ -158,6 +160,29 @@ class EvidenceIdentityTests(GuaranteeTest):
         self.assertEqual(RESULT_UNKNOWN, result["status"])
         self.assertFalse(list(foundation.pending.glob("*.json")))
 
+    def test_shared_receipt_without_any_identity_is_unknown(self):
+        shared = self.root / "external receipts" / "shared.json"
+        shared.parent.mkdir()
+        foundation = self.foundation()
+        action = foundation.config["actions"]["publish-verify"]
+        action.pop("receipt_source_dir")
+        action["receipt_source"] = str(shared)
+        foundation.enqueue(action="publish-verify", idempotency_key="shared-blank")
+        atomic_write_json(shared, {
+            "status": "SUCCESS",
+            "completed_at": (datetime.now(UTC) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
+        })
+        with mock.patch("windows_execution_foundation.core.subprocess.run", side_effect=_completed) as run:
+            result = foundation.work_once()
+        self.assertEqual(RESULT_UNKNOWN, result["status"])
+        self.assertEqual("EVIDENCE_IDENTITY_MISSING", result["reason"])
+        self.assertFalse(result["resend"])
+        self.assertEqual(1, run.call_count)
+        self.assertFalse(list(foundation.pending.glob("*.json")))
+        replay = foundation.enqueue(action="publish-verify", idempotency_key="shared-blank")
+        self.assertEqual(RESULT_UNKNOWN, replay["status"])
+        self.assertFalse(replay["resend"])
+
 
 class ReflectionRetryTests(GuaranteeTest):
     def test_matching_destination_is_adopted_instead_of_rerun(self):
@@ -192,6 +217,79 @@ class ReflectionRetryTests(GuaranteeTest):
         replay = foundation.enqueue(action="publish-verify", idempotency_key="unknown-effect")
         self.assertEqual(RESULT_UNKNOWN, replay["status"])
         self.assertFalse(list(foundation.pending.glob("*.json")))
+
+    def test_nonzero_exit_without_apply_proof_is_isolated(self):
+        foundation = self.foundation()
+        foundation.enqueue(action="publish-verify", idempotency_key="applied-unknown")
+
+        def fail(command, **_kwargs):
+            return _completed(command, code=7)
+
+        with mock.patch("windows_execution_foundation.core.subprocess.run", side_effect=fail) as run:
+            result = foundation.work_once()
+            self.assertEqual(RESULT_UNKNOWN, result["status"])
+            self.assertEqual("REFLECTION_UNCONFIRMED", result["reason"])
+            self.assertFalse(result["resend"])
+            self.assertEqual(1, run.call_count)
+            again = foundation.work_once()
+        self.assertEqual("IDLE", again["status"])
+        self.assertEqual(1, run.call_count)
+        self.assertFalse(list(foundation.pending.glob("*.json")))
+        failed = atomic_read(foundation.failed / f"{stable_key('applied-unknown')}.json")
+        self.assertEqual("UNKNOWN", failed["result_state"])
+        self.assertNotIn("stderr", failed["last_error"])
+
+    def test_explicit_not_applied_receipt_may_retry(self):
+        foundation = self.foundation()
+        foundation.enqueue(action="publish-verify", idempotency_key="not-applied")
+
+        def fail_with_receipt(command, **_kwargs):
+            inflight = next(foundation.inflight.glob("*.json"))
+            job = atomic_read(inflight)
+            atomic_write_json(self.receipt_dir / f"{job['dedup_key']}.json", {
+                "status": "NOT_APPLIED",
+                "idempotency_key": job["idempotency_key"],
+                "dedup_key": job["dedup_key"],
+                "execution_id": job["execution_id"],
+                "completed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            })
+            return _completed(command, code=3)
+
+        with mock.patch("windows_execution_foundation.core.subprocess.run", side_effect=fail_with_receipt) as run:
+            result = foundation.work_once()
+        self.assertEqual("RETRY_SPOOLED", result["status"])
+        self.assertEqual(1, run.call_count)
+        self.assertEqual(1, len(list(foundation.pending.glob("*.json"))))
+        self.assertFalse(list(foundation.failed.glob("*.json")))
+
+    def test_async_poll_does_not_launch_twice(self):
+        foundation = self.foundation()
+        foundation.config["actions"]["publish-verify"]["external_async"] = True
+        foundation.config["actions"]["publish-verify"]["external_poll_seconds"] = 1
+        foundation.enqueue(action="publish-verify", idempotency_key="async-once")
+        with mock.patch("windows_execution_foundation.core.subprocess.run", side_effect=_completed) as run:
+            first = foundation.work_once()
+            self.assertEqual("DEFERRED_EXTERNAL", first["status"])
+            pending = next(foundation.pending.glob("*.json"))
+            job = atomic_read(pending)
+            job["not_before_epoch"] = 0
+            atomic_write_json(pending, job)
+            second = foundation.work_once()
+            self.assertEqual("DEFERRED_EXTERNAL", second["status"])
+            self.assertEqual(1, run.call_count)
+            job = atomic_read(next(foundation.pending.glob("*.json")))
+            job["not_before_epoch"] = 0
+            atomic_write_json(foundation.pending / f"{job['dedup_key']}.json", job)
+            atomic_write_json(self.receipt_dir / f"{job['execution_id']}.json", {
+                "status": "PUBLISHED_VERIFIED",
+                "execution_id": job["execution_id"],
+                "idempotency_key": job["idempotency_key"],
+                "dedup_key": job["dedup_key"],
+                "completed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            })
+            third = foundation.work_once()
+        self.assertEqual("SUCCESS", third["status"])
+        self.assertEqual(1, run.call_count)
 
     def test_unspawned_dead_owner_can_be_requeued(self):
         foundation = self.foundation()
@@ -366,6 +464,31 @@ class ExitCodeTests(unittest.TestCase):
             with self.subTest(status=status):
                 self.assertEqual(code, _finish({"status": status}))
         self.assertEqual(2, _finish({"status": "IDLE", "local_exec_reason_code": "REQUEST_EXPIRED"}))
+
+    def test_work_cycle_drain_exit_preserves_failure_priority(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        foundation = ExecutionFoundation({
+            "state_dir": str(Path(tmp.name) / "state"),
+            "actions": {},
+        })
+        cases = (
+            (("SUCCESS", "FAILED_REQUEUE_RELEASE"), "FAILED_REQUEUE_RELEASE", 2),
+            (("SUCCESS", RESULT_UNKNOWN), RESULT_UNKNOWN, 1),
+            (("FAILED_REQUEUE_RELEASE", "FAILED_FINAL"), "FAILED_FINAL", 2),
+            (("SUCCESS", "RETRY_SPOOLED"), "DRAINED", 0),
+        )
+        for statuses, summary, code in cases:
+            with self.subTest(statuses=statuses):
+                jobs = [{"status": status} for status in statuses]
+                with mock.patch.object(foundation, "work_once", side_effect=jobs):
+                    result = work_cycle(foundation, max_jobs=2)
+                self.assertEqual(summary, result["status"])
+                self.assertEqual(list(statuses), [item["status"] for item in result["outcomes"]])
+                buffer = StringIO()
+                with redirect_stdout(buffer):
+                    self.assertEqual(code, _finish(result))
+                self.assertIn(summary, buffer.getvalue())
 
 
 def atomic_read(path: Path):

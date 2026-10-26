@@ -31,6 +31,23 @@ _SUCCESS_MARKS = frozenset({
 })
 _HEARTBEAT_INTERVAL_SECONDS = 30
 _CHILD_TIMEOUT_FLOOR_SECONDS = 900
+# A shared receipt must name this execution. An empty or omitted value does not count.
+_MAJOR_IDENTITY_FIELDS = (
+    "execution_id",
+    "job_id",
+    "idempotency_key",
+    "dedup_key",
+    "request_id",
+    "reservation_key",
+)
+# The destination itself says this attempt did not apply. Anything else after a spawn is unknown.
+_NOT_APPLIED_MARKS = frozenset({
+    "FAILED",
+    "NOT_APPLIED",
+    "NOT_PUBLISHED",
+    "ROLLED_BACK",
+    "REJECTED",
+})
 
 
 def iso_now() -> str:
@@ -266,7 +283,12 @@ class ExecutionFoundation:
                     if verdict == "match":
                         self._commit_success(path, job, None, evidence)
                     else:
-                        reason = "EVIDENCE_MISMATCH" if verdict == "mismatch" else "REFLECTION_UNCONFIRMED"
+                        if verdict == "mismatch":
+                            reason = "EVIDENCE_MISMATCH"
+                        elif verdict == "unbound":
+                            reason = "EVIDENCE_IDENTITY_MISSING"
+                        else:
+                            reason = "REFLECTION_UNCONFIRMED"
                         self._mark_unknown(path, job, reason)
                     recovered += 1
                     continue
@@ -436,9 +458,7 @@ class ExecutionFoundation:
             return False
         return modified >= earliest
 
-    def _evidence_target_matches(self, content: Any, job: dict[str, Any], action: dict[str, Any]) -> bool:
-        if not isinstance(content, dict):
-            return False
+    def _expected_identity(self, job: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
         expected = {
             "execution_id": job.get("execution_id"),
             "idempotency_key": job.get("idempotency_key"),
@@ -450,12 +470,29 @@ class ExecutionFoundation:
         field = action.get("receipt_request_id_field")
         if isinstance(field, str) and field:
             expected[field] = job.get("idempotency_key")
-        for key, want in expected.items():
+        return expected
+
+    def _identity_binding(self, content: Any, job: dict[str, Any], action: dict[str, Any]) -> str:
+        """match, mismatch, or unbound.
+
+        At least one major identifier must be present and equal to this job.
+        A shared receipt that omits every identifier does not prove this execution.
+        """
+        if not isinstance(content, dict):
+            return "mismatch"
+        saw_major = False
+        for key, want in self._expected_identity(job, action).items():
             if key not in content or content.get(key) in (None, ""):
                 continue
-            if content.get(key) != want:
-                return False
-        return True
+            recorded = content.get(key)
+            if want in (None, "") or recorded != want:
+                return "mismatch"
+            if key in _MAJOR_IDENTITY_FIELDS or key == action.get("receipt_request_id_field"):
+                saw_major = True
+        return "match" if saw_major else "unbound"
+
+    def _evidence_target_matches(self, content: Any, job: dict[str, Any], action: dict[str, Any]) -> bool:
+        return self._identity_binding(content, job, action) == "match"
 
     def _evidence_is_success(self, content: Any) -> bool:
         if not isinstance(content, dict):
@@ -486,20 +523,49 @@ class ExecutionFoundation:
             return "none", None
         started = job.get("execution_started_at") or job.get("claimed_at")
         saw_file = False
+        saw_unbound = False
         for path in self._evidence_candidates(action, job):
             state, payload = self._load_evidence_file(path)
             if state == "absent":
                 continue
             saw_file = True
             content = (payload or {}).get("content")
+            binding = self._identity_binding(content, job, action)
+            created_after = self._evidence_created_after(path, content, started)
             if (
                 state == "present"
                 and self._evidence_is_success(content)
-                and self._evidence_target_matches(content, job, action)
-                and self._evidence_created_after(path, content, started)
+                and binding == "match"
+                and created_after
             ):
                 return "match", payload
-        return ("mismatch", None) if saw_file else ("absent", None)
+            if state == "present" and binding == "unbound" and created_after:
+                saw_unbound = True
+        if not saw_file:
+            return "absent", None
+        if saw_unbound:
+            return "unbound", None
+        return "mismatch", None
+
+    def _evidence_explicitly_not_applied(self, action: dict[str, Any], job: dict[str, Any]) -> bool:
+        """True only when a bound receipt says this attempt did not apply."""
+        started = job.get("execution_started_at") or job.get("claimed_at")
+        for path in self._evidence_candidates(action, job):
+            state, payload = self._load_evidence_file(path)
+            if state != "present":
+                continue
+            content = (payload or {}).get("content")
+            if self._identity_binding(content, job, action) != "match":
+                continue
+            if not self._evidence_created_after(path, content, started):
+                continue
+            if not isinstance(content, dict) or self._evidence_is_success(content):
+                continue
+            for key in ("status", "terminal_status", "acquisition_status"):
+                value = content.get(key)
+                if isinstance(value, str) and value in _NOT_APPLIED_MARKS:
+                    return True
+        return False
 
     def _action_of(self, job: dict[str, Any]) -> dict[str, Any]:
         action = self.config.get("actions", {}).get(str(job.get("action") or ""), {})
@@ -688,7 +754,8 @@ class ExecutionFoundation:
         if verdict == "match":
             return self._commit_success(path, job, None, evidence)
         if action.get("external_async") and verdict == "absent":
-            return None
+            # The command already ran. Poll the destination again; do not start it twice.
+            return self._defer_external(path, job, action, safe_to_release=True)
         if verdict == "none" and not job.get("spawn_attempted"):
             return None
         if verdict == "none":
@@ -881,9 +948,21 @@ class ExecutionFoundation:
                     if verdict == "match":
                         return self._commit_success(path, job, completed, evidence)
                     if completed.returncode != 0:
-                        if verdict == "mismatch":
+                        # Retry only when this attempt is proved not to have applied.
+                        # A missing or unbound receipt after the child exits is unknown.
+                        proved_not_applied = (
+                            not self._has_reflection_destination(action)
+                            or self._evidence_explicitly_not_applied(action, job)
+                        )
+                        if not proved_not_applied:
                             safe_to_release = False
-                            return self._mark_unknown(path, job, "EVIDENCE_MISMATCH")
+                            if verdict == "mismatch":
+                                reason = "EVIDENCE_MISMATCH"
+                            elif verdict == "unbound":
+                                reason = "EVIDENCE_IDENTITY_MISSING"
+                            else:
+                                reason = "REFLECTION_UNCONFIRMED"
+                            return self._mark_unknown(path, job, reason)
                         error = f"EXIT_{completed.returncode}"
                         if not action.get("redact_subprocess_output"):
                             error += f":{completed.stderr[-1000:]}"
@@ -894,9 +973,14 @@ class ExecutionFoundation:
                     if action.get("external_async") and verdict == "absent":
                         return self._defer_external(path, job, action,
                                                     safe_to_release=safe_to_release)
-                    if verdict in {"absent", "mismatch"}:
+                    if verdict in {"absent", "mismatch", "unbound"}:
                         safe_to_release = False
-                        reason = "EVIDENCE_MISMATCH" if verdict == "mismatch" else "EVIDENCE_ABSENT_AFTER_SPAWN"
+                        if verdict == "mismatch":
+                            reason = "EVIDENCE_MISMATCH"
+                        elif verdict == "unbound":
+                            reason = "EVIDENCE_IDENTITY_MISSING"
+                        else:
+                            reason = "EVIDENCE_ABSENT_AFTER_SPAWN"
                         return self._mark_unknown(path, job, reason)
                     return self._commit_success(path, job, completed, None)
                 except subprocess.TimeoutExpired as exc:

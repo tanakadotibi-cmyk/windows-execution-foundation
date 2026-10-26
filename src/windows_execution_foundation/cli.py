@@ -88,6 +88,23 @@ def _apply_local_exec_reason(result: dict[str, Any], errors: list[dict[str, Any]
         result["local_exec_record_write_error"] = record_error
 
 
+# A multi-job drain must not hide a closed failure or an unknown result behind DRAINED.
+_DRAIN_STATUS_PRIORITY = (
+    "FAILED_FINAL",
+    "FAILED_REQUEUE_RELEASE",
+    RESULT_UNKNOWN,
+    "ATTENTION",
+)
+
+
+def _drain_summary_status(outcomes: list[dict[str, Any]]) -> str:
+    present = {str(item.get("status") or "") for item in outcomes}
+    for status in _DRAIN_STATUS_PRIORITY:
+        if status in present:
+            return status
+    return "DRAINED"
+
+
 def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, Any]:
     """Serialize ingestion as well as execution within a lane; drain at most two.
 
@@ -121,12 +138,7 @@ def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, 
     if max_jobs == 1:
         _apply_local_exec_reason(outcomes[0], errors, record_error)
         return outcomes[0]
-    if any(item["status"] == "FAILED_FINAL" for item in outcomes):
-        summary_status = "FAILED_FINAL"
-    elif any(item["status"] == RESULT_UNKNOWN for item in outcomes):
-        summary_status = RESULT_UNKNOWN
-    else:
-        summary_status = "DRAINED"
+    summary_status = _drain_summary_status(outcomes)
     summary = {"status": summary_status,
                "lane_id": foundation.config.get("lane_id", "A"), "outcomes": outcomes}
     _apply_local_exec_reason(summary, errors, record_error)
