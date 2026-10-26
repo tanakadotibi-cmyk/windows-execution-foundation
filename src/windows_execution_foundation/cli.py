@@ -44,18 +44,25 @@ def _local_exec_errors(outcomes: list[dict[str, Any]]) -> list[dict[str, Any]]:
             })
     return found
 
-def _record_local_exec_errors(foundation: ExecutionFoundation, errors: list[dict[str, Any]]) -> None:
+def _record_local_exec_errors(foundation: ExecutionFoundation, errors: list[dict[str, Any]]) -> str | None:
+    """Write the auxiliary record. A write failure returns the error type and does not raise."""
     if not errors:
-        return
-    atomic_write_json(foundation.root / "monitoring" / "local-exec-error.json", {
-        "observed_at": iso_now(),
-        "phases": errors,
-    })
+        return None
+    try:
+        atomic_write_json(foundation.root / "monitoring" / "local-exec-error.json", {
+            "observed_at": iso_now(),
+            "phases": errors,
+        })
+    except Exception as exc:
+        return type(exc).__name__ or "WRITE_FAILED"
+    return None
 
-def _apply_local_exec_reason(result: dict[str, Any], errors: list[dict[str, Any]]) -> None:
+def _apply_local_exec_reason(result: dict[str, Any], errors: list[dict[str, Any]], record_error: str | None) -> None:
     reason = next((item.get("reason_code") for item in errors if item.get("reason_code")), None)
     if reason:
         result["local_exec_reason_code"] = reason
+    if record_error:
+        result["local_exec_record_write_error"] = record_error
 
 
 def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, Any]:
@@ -87,13 +94,13 @@ def work_cycle(foundation: ExecutionFoundation, max_jobs: int = 1) -> dict[str, 
     except Exception:
         pass
     errors = _local_exec_errors(outcomes)
-    _record_local_exec_errors(foundation, errors)
+    record_error = _record_local_exec_errors(foundation, errors)
     if max_jobs == 1:
-        _apply_local_exec_reason(outcomes[0], errors)
+        _apply_local_exec_reason(outcomes[0], errors, record_error)
         return outcomes[0]
     summary = {"status": "FAILED_FINAL" if any(x["status"] == "FAILED_FINAL" for x in outcomes) else "DRAINED",
                "lane_id": foundation.config.get("lane_id", "A"), "outcomes": outcomes}
-    _apply_local_exec_reason(summary, errors)
+    _apply_local_exec_reason(summary, errors, record_error)
     return summary
 
 def main() -> int:

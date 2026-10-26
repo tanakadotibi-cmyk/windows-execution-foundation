@@ -72,6 +72,33 @@ class CliReasonCodeTests(unittest.TestCase):
         with redirect_stdout(buffer):
             self.assertEqual(_finish(result), 0)
 
+    def test_record_write_failure_still_prints_json_and_exits_2(self):
+        with mock.patch(
+            "windows_execution_foundation.cli.run_before_work",
+            side_effect=LocalExecError("REQUEST_EXPIRED"),
+        ), mock.patch(
+            "windows_execution_foundation.cli.run_after_work",
+            return_value={"status": "PASS"},
+        ), mock.patch.object(self.foundation, "work_once", return_value={"status": "IDLE"}), mock.patch(
+            "windows_execution_foundation.cli.atomic_write_json",
+            side_effect=OSError("monitoring directory is not writable"),
+        ):
+            result = work_cycle(self.foundation, 1)
+        self.assertEqual(result["local_exec"]["before"]["reason_code"], "REQUEST_EXPIRED")
+        self.assertEqual(result["local_exec_reason_code"], "REQUEST_EXPIRED")
+        self.assertEqual(result["local_exec_record_write_error"], "OSError")
+        self.assertNotIn("monitoring directory", json.dumps(result))
+        self.assertFalse((self.foundation.root / "monitoring" / "local-exec-error.json").exists())
+        buffer = StringIO()
+        with redirect_stdout(buffer):
+            code = _finish(result)
+        printed = json.loads(buffer.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(printed["local_exec_reason_code"], "REQUEST_EXPIRED")
+        self.assertEqual(printed["local_exec"]["before"]["reason_code"], "REQUEST_EXPIRED")
+        self.assertEqual(printed["local_exec_record_write_error"], "OSError")
+        self.assertNotIn("monitoring directory", buffer.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
