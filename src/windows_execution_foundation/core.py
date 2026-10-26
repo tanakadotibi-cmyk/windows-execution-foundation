@@ -31,6 +31,39 @@ def parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def classify_timestamp(value: Any) -> tuple[str, datetime | None]:
+    """Classify a timestamp. A value without an offset is not treated as UTC or JST."""
+    if value is None or value == "":
+        return "absent", None
+    if not isinstance(value, str):
+        return "unreadable", None
+    try:
+        parsed = parse_time(value)
+    except (TypeError, ValueError):
+        return "unreadable", None
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        return "naive", None
+    return "aware", parsed
+
+
+def invalid_timestamp_record(source: str, record_id: Any, field: str, value: Any) -> dict[str, Any] | None:
+    kind, _parsed = classify_timestamp(value)
+    if kind == "naive":
+        reason = "時差のない時刻"
+    elif kind == "unreadable":
+        reason = "読めない時刻"
+    else:
+        return None
+    return {
+        "category": "不正な記録",
+        "source": source,
+        "id": record_id,
+        "field": field,
+        "reason": reason,
+        "value": value if isinstance(value, str) else None,
+    }
+
+
 def stable_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -555,6 +588,86 @@ class ExecutionFoundation:
             value["alert_error"] = type(exc).__name__
         return value
 
+    def _eligible_since(self, job: dict[str, Any], not_before: float) -> datetime | None:
+        kind, created = classify_timestamp(job.get("created_at"))
+        if kind != "aware" or created is None:
+            return None
+        if not_before > 0:
+            ready = datetime.fromtimestamp(not_before, UTC)
+            return ready if ready > created else created
+        return created
+
+    def _queue_delay(self, pending: list[Path]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Deadline check for pending receipts. Bad clocks become attention items, not exceptions."""
+        now = datetime.now(UTC)
+        allowed = int(self.config.get("pending_allowed_delay_seconds", 900))
+        oldest: datetime | None = None
+        overdue: list[Any] = []
+        unprocessable_pending: list[str] = []
+        invalid_records: list[dict[str, Any]] = []
+        eligible = 0
+        ineligible = 0
+        for path in pending:
+            try:
+                job = read_json(path, {})
+            except (json.JSONDecodeError, OSError, UnicodeError):
+                unprocessable_pending.append(path.stem)
+                continue
+            if not isinstance(job, dict):
+                unprocessable_pending.append(path.stem)
+                continue
+            try:
+                not_before = float(job.get("not_before_epoch") or 0)
+            except (TypeError, ValueError):
+                unprocessable_pending.append(path.stem)
+                continue
+            record_id = job.get("execution_id") or job.get("job_id") or path.stem
+            invalid = invalid_timestamp_record("pending", record_id, "created_at", job.get("created_at"))
+            if invalid is not None:
+                invalid_records.append(invalid)
+                continue
+            if not_before > time.time():
+                ineligible += 1
+                continue
+            eligible += 1
+            try:
+                start = self._eligible_since(job, not_before)
+                if start is None:
+                    overdue.append(record_id)
+                    continue
+                if oldest is None or start < oldest:
+                    oldest = start
+                if (now - start).total_seconds() > allowed:
+                    overdue.append(record_id)
+            except (TypeError, ValueError, OverflowError, OSError):
+                invalid_records.append(
+                    {
+                        "category": "不正な記録",
+                        "source": "pending",
+                        "id": record_id,
+                        "field": "created_at",
+                        "reason": "時刻の比較に失敗",
+                        "value": job.get("created_at") if isinstance(job.get("created_at"), str) else None,
+                    }
+                )
+        queue_status = "PASS" if not overdue and not unprocessable_pending else "ATTENTION"
+        oldest_wait = 0.0 if oldest is None else (now - oldest).total_seconds()
+        queue_delay = {
+            "status": queue_status,
+            "pending_count": len(pending),
+            "eligible_pending_count": eligible,
+            "ineligible_pending_count": ineligible,
+            "oldest_waiting_at": (
+                oldest.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                if oldest else None
+            ),
+            "oldest_wait_seconds": oldest_wait,
+            "allowed_delay_seconds": allowed,
+            "overdue_count": len(overdue),
+            "unprocessable_pending": unprocessable_pending,
+        }
+        return queue_delay, invalid_records
+
     def audit(self) -> dict[str, Any]:
         pending = list(self.pending.glob("*.json"))
         inflight = list(self.inflight.glob("*.json"))
@@ -563,13 +676,22 @@ class ExecutionFoundation:
         receipts = list(self.receipts.glob("*.json"))
         keys = [p.stem for p in receipts]
         duplicate_receipts = len(keys) - len(set(keys))
+        queue_delay, invalid_records = self._queue_delay(pending)
+        structural_ok = not inflight and not failed and duplicate_receipts == 0
+        status = (
+            "PASS"
+            if structural_ok and queue_delay["status"] == "PASS" and not invalid_records
+            else "ATTENTION"
+        )
         result = {
-            "status": "PASS" if not inflight and not failed and duplicate_receipts == 0 else "ATTENTION",
+            "status": status,
             "observed_at": iso_now(),
             "counts": {"pending": len(pending), "inflight": len(inflight), "done": len(done),
                        "failed": len(failed), "receipts": len(receipts)},
             "duplicate_receipts": duplicate_receipts,
             "receipt_coverage": 1.0 if not done else min(1.0, len(receipts) / len(done)),
+            "queue_delay": queue_delay,
+            "invalid_records": invalid_records,
             "remote_required_actions": [name for name, action in self.config.get("actions", {}).items()
                                         if action.get("requires_remote")],
         }

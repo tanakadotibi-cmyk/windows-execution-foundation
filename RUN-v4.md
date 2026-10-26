@@ -12,7 +12,12 @@ Set-Location $Root
 
 書き先スプレッドシートは「経営数字_CTI_City_v1」（ID `1R_xQV6AYIwRRK1fW-AInwm2rXoThmOFRhNSjgeH8swI`）です。本番タブは `city_metric_detail` / `city_daily_summary` / `run_log` です。Airtable には読み書きしません。結果 JSON の `airtable_write_count` は 0 です。
 
-認証は CurrentUser DPAPI で暗号化したサービスアカウント JSON です。既定パスは `C:\TantanJobs\secrets\sheets_writer_sa.dpapi`（ユーザー epuro）です。別の場所なら `--credential` で渡します。サービスアカウントは `<SA_EMAIL>`、scope は `https://www.googleapis.com/auth/spreadsheets` だけです。鍵の中身とトークンは標準出力・ログ・例外に出しません。pyenv-tasks の Python に google-auth 2.62.0 が入っている前提です。
+認証は CurrentUser DPAPI で暗号化したサービスアカウント JSON です。既定パスは `C:\TantanJobs\secrets\sheets_writer_sa.dpapi`（ユーザー epuro）です。別の場所なら `--credential` で渡します。サービスアカウントのメールアドレスはソースに書きません。次のどちらかに、実機だけへ置いてください。
+
+- `config.json`（実機では Git に入らない `local\config.json`）のキー `cityheaven_daily_v4_client_email`
+- 環境変数 `WEF_CITYHEAVEN_V4_CLIENT_EMAIL`
+
+両方あるときは同じアドレスであること。違うときは `EXPECTED_CLIENT_EMAIL_CONFLICT` で止まります。どちらも無い、空、または `<SA_EMAIL>` のようなプレースホルダのときは `EXPECTED_CLIENT_EMAIL_UNCONFIGURED` で止まります。`--config` で渡したファイルを見ます。scope は `https://www.googleapis.com/auth/spreadsheets` だけです。鍵の中身とトークンは標準出力・ログ・例外に出しません。pyenv-tasks の Python に google-auth 2.62.0 が入っている前提です。
 
 ## 1. 新しいファイルを置く
 

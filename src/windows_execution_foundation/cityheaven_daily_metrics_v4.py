@@ -35,7 +35,10 @@ WRITER = "cityheaven_daily_v4"
 BUSINESS_ID = "biz_epron_lady"
 VERSION = "cityheaven_daily_v1"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-EXPECTED_CLIENT_EMAIL = "<SA_EMAIL>"
+# The service-account address is not stored in source. Set either
+# config.json key cityheaven_daily_v4_client_email or this environment variable.
+CLIENT_EMAIL_ENV = "WEF_CITYHEAVEN_V4_CLIENT_EMAIL"
+CLIENT_EMAIL_CONFIG_KEY = "cityheaven_daily_v4_client_email"
 DEFAULT_CREDENTIAL = Path(r"C:\TantanJobs\secrets\sheets_writer_sa.dpapi")
 API = "https://sheets.googleapis.com/v4/spreadsheets/" + SPREADSHEET_ID
 PRODUCTION_TABS = ("city_metric_detail", "city_daily_summary", "run_log")
@@ -609,12 +612,58 @@ def dpapi_decrypt(data: bytes) -> bytes:
         raise SheetError("CREDENTIAL_DECRYPT_FAILED") from None
 
 
+def _configured_client_email(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or "@" not in text or any(char.isspace() for char in text):
+        return None
+    if "<" in text or ">" in text:
+        return None
+    return text
+
+
+def expected_client_email(config_path: Path | None = None) -> str:
+    """Read the expected service-account address from the environment or config.json."""
+    env = _configured_client_email(os.environ.get(CLIENT_EMAIL_ENV))
+    path = Path(config_path) if config_path is not None else daily.DEFAULT_CONFIG
+    file_value = None
+    unreadable = False
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            loaded = None
+            unreadable = True
+        if isinstance(loaded, dict):
+            file_value = _configured_client_email(loaded.get(CLIENT_EMAIL_CONFIG_KEY))
+    if env and file_value and env != file_value:
+        raise SheetError(
+            "EXPECTED_CLIENT_EMAIL_CONFLICT",
+            hint="config.json の cityheaven_daily_v4_client_email と環境変数 WEF_CITYHEAVEN_V4_CLIENT_EMAIL が違います",
+        )
+    chosen = env or file_value
+    if chosen:
+        return chosen
+    if unreadable and not env:
+        raise SheetError(
+            "EXPECTED_CLIENT_EMAIL_UNCONFIGURED",
+            hint="config.json を読めません。cityheaven_daily_v4_client_email か環境変数 WEF_CITYHEAVEN_V4_CLIENT_EMAIL を設定してください",
+        )
+    raise SheetError(
+        "EXPECTED_CLIENT_EMAIL_UNCONFIGURED",
+        hint="config.json の cityheaven_daily_v4_client_email か環境変数 WEF_CITYHEAVEN_V4_CLIENT_EMAIL を設定してください",
+    )
+
+
 def open_authorized_session(
     path: Path,
     *,
     decrypt: Callable[[bytes], bytes] = dpapi_decrypt,
     scrubber: Scrubber | None = None,
+    config_path: Path | None = None,
 ) -> Any:
+    expected = expected_client_email(config_path)
     scrubber = scrubber or get_scrubber()
     info: Any = None
     try:
@@ -636,7 +685,7 @@ def open_authorized_session(
         if not isinstance(info, dict):
             raise SheetError("CREDENTIAL_DECRYPT_FAILED")
         scrubber.remember(info)
-        if info.get("client_email") != EXPECTED_CLIENT_EMAIL:
+        if info.get("client_email") != expected:
             raise SheetError("CREDENTIAL_IDENTITY_MISMATCH")
         try:
             from google.oauth2 import service_account
@@ -664,8 +713,13 @@ def open_authorized_session(
                     info[key] = ""
 
 
-def open_transport(path: Path, *, decrypt: Callable[[bytes], bytes] = dpapi_decrypt) -> GoogleSheetTransport:
-    return GoogleSheetTransport(open_authorized_session(path, decrypt=decrypt))
+def open_transport(
+    path: Path,
+    *,
+    decrypt: Callable[[bytes], bytes] = dpapi_decrypt,
+    config_path: Path | None = None,
+) -> GoogleSheetTransport:
+    return GoogleSheetTransport(open_authorized_session(path, decrypt=decrypt, config_path=config_path))
 
 
 def _read_json_file(path: Path, code: str) -> tuple[dict[str, Any], bytes]:
@@ -1123,12 +1177,16 @@ def run_v4(
             analysis, meta = _load_analysis_for_receipt(receipt)
             allow_partial = False
         if transport is None and not dry_run:
-            loader = transport_loader or open_transport
-            transport = loader(credential)
+            if transport_loader is None:
+                transport = open_transport(credential, config_path=config)
+            else:
+                transport = transport_loader(credential)
         elif transport is None and dry_run:
-            loader = transport_loader or open_transport
             try:
-                transport = loader(credential)
+                if transport_loader is None:
+                    transport = open_transport(credential, config_path=config)
+                else:
+                    transport = transport_loader(credential)
             except SheetError as exc:
                 if not _skippable_read(exc):
                     raise
